@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@source "./**/*.{tsx,ts,jsx,js,html}";
 
 :root {
   font-family: "Trebuchet MS", "Segoe UI", sans-serif;
