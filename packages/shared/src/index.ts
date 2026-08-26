@@ -1,0 +1,11 @@
+export type GameKind = 'this_or_that' | 'twenty_questions' | 'guess_my_answer'
+export type PairState = 'open_play' | 'pending' | 'mutual' | 'closed' | 'unmatched' | 'expired' | 'blocked'
+export type SessionState =
+  | 'pending'
+  | 'countdown'
+  | 'in_round'
+  | 'reveal_round'
+  | 'scoring'
+  | 'completed'
+  | 'forfeit'
+  | 'cancelled'
