@@ -1,0 +1,16 @@
+@import "tailwindcss";
+
+:root {
+  font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+  color: #f4e9ff;
+  background: #0b0614;
+}
+
+html, body, #root {
+  min-height: 100%;
+  margin: 0;
+  background: radial-gradient(1200px 600px at 50% -10%, #3a1466 0%, #0b0614 55%);
+}
+
+button { cursor: pointer; }
+input, select, textarea { font: inherit; color: inherit; }
