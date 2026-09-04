@@ -10,7 +10,12 @@ Schedule::call(function () {
     GameSession::query()
         ->whereNotIn('state', ['completed', 'forfeit', 'cancelled'])
         ->each(fn ($s) => GameEngine::advance($s->fresh(['rounds.answers', 'participants'])));
-})->everyMinute();
+})->everyMinute()->name('gamematch-advance')->withoutOverlapping();
+
+Schedule::command('queue:work --stop-when-empty --max-time=50 --tries=3')
+    ->everyMinute()
+    ->name('gamematch-queue-drain')
+    ->withoutOverlapping();
 
 Artisan::command('inspire', function () {
     $this->comment(Inspiring::quote());

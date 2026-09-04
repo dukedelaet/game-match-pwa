@@ -39,6 +39,12 @@ class ApiController extends Controller
 {
     public function health()
     {
+        try {
+            \Illuminate\Support\Facades\DB::select('select 1');
+        } catch (\Throwable) {
+            return response()->json(['ok' => false], 503);
+        }
+
         return ['ok' => true];
     }
 

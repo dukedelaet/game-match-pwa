@@ -18,6 +18,8 @@ Or `bash scripts/dev.sh` after migrate.
 
 Open http://localhost:5173
 
+Production deploys from the **`release`** branch via GitHub Actions (not from `main`). See `docs/runbooks/deploy.md` and `docs/runbooks/restore.md`.
+
 Demo accounts (code **123456**):
 
 - Alex `+15551111111`

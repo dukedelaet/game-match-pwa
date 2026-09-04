@@ -3,8 +3,13 @@
 Hostinger Business includes daily MySQL backups.
 
 1. Download the latest dump from hPanel.
-2. `mysql -u gamematch -p gamematch < dump.sql`
-3. Confirm `php artisan migrate:status` is current.
-4. Photo files live in `storage/app/photos` — restore those from the account file backup.
+2. `mysql -u … -p … < dump.sql` (use the hPanel database name, often prefixed).
+3. Confirm `php artisan migrate:status` is current on `current/`.
+4. Photo files live in **`shared/storage/app/photos`** — restore those from the account file backup.
 
-Locally, `php artisan migrate:fresh --seed` rebuilds a demo database (destroys data).
+If catalogs were wiped, re-run `php artisan db:seed --class=CatalogSeeder --force` (`updateOrCreate`, safe on non-empty tables).
+
+Never `migrate:fresh` and never `DatabaseSeeder` on Hostinger.
+
+Locally, `php artisan migrate:fresh --seed` rebuilds a demo database (destroys data; includes Alex/Jordan).
+

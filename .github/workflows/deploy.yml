@@ -1,0 +1,124 @@
+name: Deploy production
+
+on:
+  push:
+    branches: [release]
+
+concurrency:
+  group: production-hostinger
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_DATABASE: gamematch_test
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval=5s --health-timeout=5s --health-retries=15
+    env:
+      DB_CONNECTION: mysql
+      DB_HOST: 127.0.0.1
+      DB_PORT: 3306
+      DB_DATABASE: gamematch_test
+      DB_USERNAME: root
+      DB_PASSWORD: root
+      DB_URL: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: gd, pdo_mysql, mbstring, tokenizer, xml, ctype, curl, fileinfo, zip
+          coverage: none
+      - name: PWA lint and build
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm --filter web lint
+          pnpm --filter web build
+      - name: API tests
+        working-directory: apps/api
+        run: |
+          composer install --no-interaction --prefer-dist
+          cp .env.example .env
+          php artisan key:generate
+          php artisan test
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: gd, pdo_mysql, mbstring, tokenizer, xml, ctype, curl, fileinfo, zip
+          coverage: none
+      - name: Build SPA and API vendor
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm --filter web build
+          bash scripts/sync-spa.sh
+          cd apps/api
+          composer install --no-dev --optimize-autoloader --no-scripts --no-interaction --prefer-dist
+      - name: rsync release and run remote script
+        env:
+          HOSTINGER_SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
+          HOSTINGER_SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
+          HOSTINGER_SSH_KEY: ${{ secrets.HOSTINGER_SSH_KEY }}
+          HOSTINGER_SSH_KNOWN_HOSTS: ${{ secrets.HOSTINGER_SSH_KNOWN_HOSTS }}
+          HOSTINGER_SSH_PORT: ${{ vars.HOSTINGER_SSH_PORT }}
+          HOSTINGER_DOMAIN_PATH: ${{ vars.HOSTINGER_DOMAIN_PATH }}
+          HOSTINGER_PHP_BIN: ${{ vars.HOSTINGER_PHP_BIN }}
+          PRODUCTION_URL: ${{ vars.PRODUCTION_URL }}
+        run: |
+          set -euo pipefail
+          : "${HOSTINGER_SSH_HOST:?missing secret HOSTINGER_SSH_HOST}"
+          : "${HOSTINGER_SSH_USER:?missing secret HOSTINGER_SSH_USER}"
+          : "${HOSTINGER_SSH_KEY:?missing secret HOSTINGER_SSH_KEY}"
+          : "${HOSTINGER_SSH_KNOWN_HOSTS:?missing secret HOSTINGER_SSH_KNOWN_HOSTS}"
+          PORT="${HOSTINGER_SSH_PORT:-65002}"
+          eval "$(ssh-agent -s)"
+          umask 077
+          KEY_FILE="$(mktemp)"
+          KNOWN="$(mktemp)"
+          printf '%s\n' "$HOSTINGER_SSH_KEY" > "$KEY_FILE"
+          printf '%s\n' "$HOSTINGER_SSH_KNOWN_HOSTS" > "$KNOWN"
+          ssh-add "$KEY_FILE"
+          SSH="ssh -p ${PORT} -o UserKnownHostsFile=${KNOWN} -o IdentitiesOnly=yes"
+          $SSH "${HOSTINGER_SSH_USER}@${HOSTINGER_SSH_HOST}" "mkdir -p ${HOSTINGER_DOMAIN_PATH}/releases/${GITHUB_SHA}"
+          rsync -az --delete \
+            --exclude '.env' \
+            --exclude 'storage/' \
+            --exclude 'tests/' \
+            --exclude 'phpunit.xml' \
+            --exclude 'node_modules/' \
+            --exclude '.git/' \
+            -e "$SSH" \
+            apps/api/ "${HOSTINGER_SSH_USER}@${HOSTINGER_SSH_HOST}:${HOSTINGER_DOMAIN_PATH}/releases/${GITHUB_SHA}/"
+          $SSH "${HOSTINGER_SSH_USER}@${HOSTINGER_SSH_HOST}" \
+            "env DOMAIN_PATH=$(printf %q "$HOSTINGER_DOMAIN_PATH") SHA=$(printf %q "$GITHUB_SHA") PHP_BIN=$(printf %q "$HOSTINGER_PHP_BIN") PRODUCTION_URL=$(printf %q "$PRODUCTION_URL") bash -s" \
+            < scripts/deploy-remote.sh
+          rm -f "$KEY_FILE" "$KNOWN"
