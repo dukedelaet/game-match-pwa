@@ -38,7 +38,7 @@ func (s *Server) Router() http.Handler {
 
 			r.Get("/home", s.home)
 
-			r.Post("/queue", s.queueJoin)
+			r.Post("/queue", s.idempotent("POST /queue", s.queueJoin))
 			r.Get("/queue/status", s.queueStatus)
 			r.Delete("/queue", s.queueLeave)
 
@@ -50,14 +50,14 @@ func (s *Server) Router() http.Handler {
 
 			r.Get("/pairs", s.pairs)
 			r.Get("/pairs/{id}", s.pairShow)
-			r.Post("/pairs/{id}/connect", s.pairAct)
+			r.Post("/pairs/{id}/connect", s.idempotent("POST /pairs/:id/connect", s.pairAct))
 			r.Post("/pairs/{id}/unmatch", s.unmatch)
 
 			r.Get("/threads", s.threads)
 			r.Get("/threads/{id}/messages", s.messages)
-			r.Post("/threads/{id}/messages", s.sendMessage)
+			r.Post("/threads/{id}/messages", s.idempotent("POST /threads/:id/messages", s.sendMessage))
 
-			r.Post("/invites", s.inviteCreate)
+			r.Post("/invites", s.idempotent("POST /invites", s.inviteCreate))
 			r.Post("/invites/{id}/accept", s.inviteAccept)
 			r.Post("/invites/{id}/decline", s.inviteDecline)
 
