@@ -38,7 +38,10 @@ func newTestServer(t *testing.T) (*Server, *store.Store) {
 	require.NoError(t, seed.Run(context.Background(), st, cfg))
 	engine := game.NewEngine(st, cfg)
 	matcher := game.NewMatcher(st, cfg)
-	return NewServer(st, engine, matcher, cfg), st
+	srv := NewServer(st, engine, matcher, cfg)
+	// Tests drive rapid polling; throttling has its own tests.
+	srv.DisableRateLimits = true
+	return srv, st
 }
 
 type client struct {

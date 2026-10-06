@@ -23,6 +23,11 @@ func (s *Server) block(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
 		return
 	}
+	// Blocking cancels any pending invites in both directions (§Block).
+	if err := s.Store.CancelPendingInvites(ctx, u.ID, body.UserID); err != nil {
+		WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
+		return
+	}
 	a, b := game.OrderedPair(u.ID, body.UserID)
 	if pair, _ := s.Store.PairFor(ctx, a, b); pair != nil {
 		pair.State = "blocked"
@@ -89,6 +94,13 @@ func (s *Server) report(w http.ResponseWriter, r *http.Request) {
 	_ = decodeJSON(r, &body)
 	if body.Reason == "" {
 		body.Reason = "other"
+	}
+	// Reports of csam/underage are never dropped (§Reports); everything else is
+	// limited to 10/day per reporter.
+	if body.Reason != "csam" && body.Reason != "underage" {
+		if !s.allow(w, r, "reports:"+u.ID, limitReportsPerUser, windowReports) {
+			return
+		}
 	}
 	var subject *string
 	if body.UserID != "" {

@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math/big"
 	"net/http"
 	"regexp"
@@ -13,7 +14,11 @@ import (
 
 	"gamematch/internal/config"
 	"gamematch/internal/game"
+	"gamematch/internal/push"
+	"gamematch/internal/ratelimit"
+	"gamematch/internal/sms"
 	"gamematch/internal/store"
+	"gamematch/internal/turnstile"
 )
 
 const (
@@ -28,11 +33,30 @@ type Server struct {
 	Matcher   *game.Matcher
 	Cfg       config.Config
 	PhotosDir string
+
+	Limiter   *ratelimit.Limiter
+	SMS       sms.Provider
+	Turnstile turnstile.Verifier
+	Push      *push.Sender
+
+	// DisableRateLimits bypasses throttling. Tests set it so poll-heavy flows
+	// do not have to sleep; the limiter has its own tests.
+	DisableRateLimits bool
 }
 
 // NewServer builds a Server.
 func NewServer(st *store.Store, engine *game.Engine, matcher *game.Matcher, cfg config.Config) *Server {
-	return &Server{Store: st, Engine: engine, Matcher: matcher, Cfg: cfg, PhotosDir: cfg.PhotosDir()}
+	return &Server{
+		Store:     st,
+		Engine:    engine,
+		Matcher:   matcher,
+		Cfg:       cfg,
+		PhotosDir: cfg.PhotosDir(),
+		Limiter:   ratelimit.New(st.DB),
+		SMS:       sms.New(cfg),
+		Turnstile: turnstile.New(cfg.TurnstileSecret),
+		Push:      push.New(cfg),
+	}
 }
 
 var phoneRE = regexp.MustCompile(`^\+?[0-9]{10,15}$`)
@@ -57,11 +81,31 @@ func randomCode() string {
 
 func (s *Server) otpStart(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Phone string `json:"phone"`
+		Phone          string `json:"phone"`
+		TurnstileToken string `json:"turnstileToken"`
 	}
 	_ = decodeJSON(r, &body)
+	ip := clientIP(r)
+
+	// A challenge is demanded only after repeated failures from one IP, and
+	// only when Turnstile is configured.
+	if !s.turnstileOK(r, ip, body.TurnstileToken) {
+		WriteError(w, http.StatusForbidden, "captcha_required", "Complete the challenge and try again")
+		return
+	}
+
+	// OTP start always answers {ok:true} so it cannot be used to probe which
+	// phone numbers exist; limits are enforced silently.
+	if !s.withinLimit(r, "otp:start:ip:"+ip, limitOTPStartPerIP, windowOTP) {
+		WriteJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		return
+	}
 	phone := store.NormalizePhone(body.Phone)
 	if !phoneRE.MatchString(phone) {
+		WriteJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		return
+	}
+	if !s.withinLimit(r, "otp:start:phone:"+phone, limitOTPStartPerPhone, windowOTP) {
 		WriteJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return
 	}
@@ -85,6 +129,12 @@ func (s *Server) otpStart(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
 		return
 	}
+	// The kill switch flag disables outbound SMS during an incident.
+	if s.Store.FlagOn(r.Context(), "auth.otp") {
+		if err := s.SMS.Send(r.Context(), phone, "Your GameMatch code is "+code); err != nil {
+			log.Printf("sms send: %v", err)
+		}
+	}
 	out := map[string]any{"ok": true}
 	if s.Cfg.Debug {
 		out["devCode"] = code
@@ -99,11 +149,20 @@ func (s *Server) otpVerify(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = decodeJSON(r, &body)
 	phone := store.NormalizePhone(body.Phone)
+	ip := clientIP(r)
+
+	if !s.allow(w, r, "otp:verify:phone:"+phone, limitOTPVerifyPerPhone, windowOTP) {
+		return
+	}
+
 	expected, ok := s.Store.TakeOTP(r.Context(), phone)
 	if !ok || body.Code != expected {
+		// Count failures per IP so a challenge can be demanded at OTP start.
+		s.Limiter.Bump(r.Context(), "otp:fail:ip:"+ip, windowOTP)
 		WriteError(w, http.StatusUnauthorized, "invalid", "That code did not match")
 		return
 	}
+	_ = s.Limiter.Reset(r.Context(), "otp:fail:ip:"+ip)
 	hash := store.HashPhone(phone)
 	u, err := s.Store.UserByPhoneHash(r.Context(), hash)
 	if err != nil {

@@ -18,8 +18,8 @@ type seedGender struct {
 }
 
 type seedTrait struct {
-	id, slug, label, emoji string
-	sort                   int
+	id, slug, label, emoji, axis string
+	sort                         int
 }
 
 var seedGenders = []seedGender{
@@ -30,16 +30,16 @@ var seedGenders = []seedGender{
 }
 
 var seedTraits = []seedTrait{
-	{"11111111-1111-4111-8111-111111111120", "competitive", "Competitive", "🔥", 0},
-	{"11111111-1111-4111-8111-111111111121", "funny", "Funny", "😂", 1},
-	{"11111111-1111-4111-8111-111111111122", "creative", "Creative", "🎨", 2},
-	{"11111111-1111-4111-8111-111111111123", "night-owl", "Night owl", "🌙", 3},
-	{"11111111-1111-4111-8111-111111111124", "music", "Music lover", "🎵", 4},
-	{"11111111-1111-4111-8111-111111111125", "active", "Active", "🏋️", 5},
-	{"11111111-1111-4111-8111-111111111126", "social", "Social", "🍻", 6},
-	{"11111111-1111-4111-8111-111111111127", "nerdy", "Nerdy", "🧠", 7},
-	{"11111111-1111-4111-8111-111111111128", "romantic", "Romantic", "❤️", 8},
-	{"11111111-1111-4111-8111-111111111129", "chaotic", "Chaotic", "😈", 9},
+	{"11111111-1111-4111-8111-111111111120", "competitive", "Competitive", "🔥", "personality", 0},
+	{"11111111-1111-4111-8111-111111111121", "funny", "Funny", "😂", "personality", 1},
+	{"11111111-1111-4111-8111-111111111122", "creative", "Creative", "🎨", "personality", 2},
+	{"11111111-1111-4111-8111-111111111123", "night-owl", "Night owl", "🌙", "lifestyle", 3},
+	{"11111111-1111-4111-8111-111111111124", "music", "Music lover", "🎵", "interest", 4},
+	{"11111111-1111-4111-8111-111111111125", "active", "Active", "🏋️", "lifestyle", 5},
+	{"11111111-1111-4111-8111-111111111126", "social", "Social", "🍻", "personality", 6},
+	{"11111111-1111-4111-8111-111111111127", "nerdy", "Nerdy", "🧠", "personality", 7},
+	{"11111111-1111-4111-8111-111111111128", "romantic", "Romantic", "❤️", "personality", 8},
+	{"11111111-1111-4111-8111-111111111129", "chaotic", "Chaotic", "😈", "personality", 9},
 }
 
 const (
@@ -73,7 +73,11 @@ func Run(ctx context.Context, s *store.Store, cfg config.Config) error {
 		}
 	}
 	for _, t := range seedTraits {
-		if err := exec(ctx, tx, `INSERT OR IGNORE INTO traits (id, slug, label, emoji, sort) VALUES (?,?,?,?,?)`, t.id, t.slug, t.label, t.emoji, t.sort); err != nil {
+		if err := exec(ctx, tx, `INSERT OR IGNORE INTO traits (id, slug, label, emoji, sort, axis) VALUES (?,?,?,?,?,?)`, t.id, t.slug, t.label, t.emoji, t.sort, t.axis); err != nil {
+			return err
+		}
+		// Keep the classification current for rows seeded before the axis column.
+		if err := exec(ctx, tx, `UPDATE traits SET axis = ? WHERE slug = ?`, t.axis, t.slug); err != nil {
 			return err
 		}
 	}

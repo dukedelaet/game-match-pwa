@@ -3,6 +3,7 @@ package httpapi
 import (
 	"net/http"
 
+	"gamematch/internal/push"
 	"gamematch/internal/store"
 )
 
@@ -152,6 +153,9 @@ func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
 		return
 	}
+	if !s.allow(w, r, "messages:"+thread.ID, limitMessagesPerThread, windowMessages) {
+		return
+	}
 	sender := u.ID
 	msg := &store.Message{ThreadID: thread.ID, SenderID: &sender, Kind: "text", Body: text}
 	if err := s.Store.InsertMessage(ctx, msg); err != nil {
@@ -172,6 +176,16 @@ func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
 		return
 	}
+	other := m.UserA
+	if u.ID == m.UserA {
+		other = m.UserB
+	}
+	s.notifyPush(ctx, other, push.Message{
+		Title: "New message",
+		Body:  text,
+		URL:   "/chat/" + thread.ID,
+		Tag:   "thread-" + thread.ID,
+	})
 	WriteJSON(w, http.StatusOK, map[string]string{"id": msg.ID})
 }
 

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"time"
 
+	"gamematch/internal/push"
 	"gamematch/internal/store"
 )
 
@@ -227,6 +228,12 @@ func (s *Server) mutual(ctx context.Context, p *store.Pair) error {
 		if err := s.Store.AddXP(ctx, uid, 20); err != nil {
 			return err
 		}
+		s.notifyPush(ctx, uid, push.Message{
+			Title: "You matched",
+			Body:  "Say hi before the spark fades.",
+			URL:   "/chat",
+			Tag:   "match",
+		})
 	}
 	return nil
 }

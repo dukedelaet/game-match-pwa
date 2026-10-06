@@ -16,6 +16,9 @@ const maxPhotoBytes = 10 << 20
 func (s *Server) uploadPhoto(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	u := currentUser(r)
+	if !s.allow(w, r, "photos:"+u.ID, limitPhotosPerUser, windowPhotos) {
+		return
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxPhotoBytes+1<<20)
 	if err := r.ParseMultipartForm(maxPhotoBytes); err != nil {
 		WriteError(w, http.StatusUnprocessableEntity, "bad_image", "Could not read that photo")

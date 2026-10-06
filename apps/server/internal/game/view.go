@@ -20,6 +20,7 @@ type RoundView struct {
 	Kind              string          `json:"kind"`
 	Prompt            json.RawMessage `json:"prompt"`
 	YourRole          *string         `json:"yourRole"`
+	Phase             *string         `json:"phase"`
 	Deadline          Deadline        `json:"deadline"`
 	YouSubmitted      bool            `json:"youSubmitted"`
 	OpponentSubmitted bool            `json:"opponentSubmitted"`
@@ -142,19 +143,15 @@ func (e *Engine) buildView(ctx context.Context, sessionID, userID string) (Sessi
 		you := answerFor(answers, userID)
 		them := answerFor(answers, oppID)
 
-		var yourRole *string
-		if ses.Kind == "guess_my_answer" && round.Extra != nil {
-			var extra struct {
-				Answerer string `json:"answerer"`
-				Guesser  string `json:"guesser"`
+		var yourRole, phase *string
+		if roles, ok := gmaFor(*round); ok {
+			role := "guesser"
+			if roles.Answerer == userID {
+				role = "answerer"
 			}
-			if err := json.Unmarshal([]byte(*round.Extra), &extra); err == nil {
-				role := "guesser"
-				if extra.Answerer == userID {
-					role = "answerer"
-				}
-				yourRole = &role
-			}
+			yourRole = &role
+			p := roles.Phase
+			phase = &p
 		}
 
 		roundView = &RoundView{
@@ -163,6 +160,7 @@ func (e *Engine) buildView(ctx context.Context, sessionID, userID string) (Sessi
 			Kind:              ses.Kind,
 			Prompt:            promptRaw,
 			YourRole:          yourRole,
+			Phase:             phase,
 			Deadline:          Deadline{AnswerBy: round.AnswerBy, ServerNow: now},
 			YouSubmitted:      you != nil,
 			OpponentSubmitted: them != nil,
@@ -170,16 +168,10 @@ func (e *Engine) buildView(ctx context.Context, sessionID, userID string) (Sessi
 
 		if ses.State == "reveal_round" {
 			same := you != nil && them != nil && jsonEqual(you.Payload, them.Payload)
-			if ses.Kind == "guess_my_answer" && round.Extra != nil {
-				var extra struct {
-					Answerer string `json:"answerer"`
-					Guesser  string `json:"guesser"`
-				}
-				if err := json.Unmarshal([]byte(*round.Extra), &extra); err == nil {
-					ans := answerFor(answers, extra.Answerer)
-					guess := answerFor(answers, extra.Guesser)
-					same = ans != nil && guess != nil && jsonEqual(ans.Payload, guess.Payload)
-				}
+			if roles, ok := gmaFor(*round); ok {
+				ans := answerFor(answers, roles.Answerer)
+				guess := answerFor(answers, roles.Guesser)
+				same = ans != nil && guess != nil && jsonEqual(ans.Payload, guess.Payload)
 			}
 			reveal = &Reveal{
 				Index:    round.RoundIndex,

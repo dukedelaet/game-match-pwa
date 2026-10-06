@@ -193,6 +193,13 @@ func (s *Store) InsertRound(ctx context.Context, r *Round) error {
 	return err
 }
 
+// PutRoundExtra updates a round's extra JSON and its answer deadline. Used when
+// Guess My Answer moves from the answer phase to the guess phase.
+func (s *Store) PutRoundExtra(ctx context.Context, roundID, extra, answerBy string) error {
+	_, err := s.DB.ExecContext(ctx, `UPDATE rounds SET extra=?, answer_by=? WHERE id=?`, extra, answerBy, roundID)
+	return err
+}
+
 // RoundByIndex loads a session round.
 func (s *Store) RoundByIndex(ctx context.Context, sessionID string, index int) (*Round, error) {
 	var r Round

@@ -21,6 +21,8 @@ export default defineConfig({
       workbox: {
         navigateFallback: '/offline',
         globPatterns: ['**/*.{js,css,html,svg,ico,webp}'],
+        // Registers the Web Push listeners alongside the generated worker.
+        importScripts: ['push-sw.js'],
       },
     }),
   ],

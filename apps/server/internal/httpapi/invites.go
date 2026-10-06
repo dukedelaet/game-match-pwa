@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"gamematch/internal/game"
+	"gamematch/internal/push"
 	"gamematch/internal/store"
 )
 
@@ -14,6 +15,9 @@ func (s *Server) inviteCreate(w http.ResponseWriter, r *http.Request) {
 		GameKind     string `json:"gameKind"`
 	}
 	_ = decodeJSON(r, &body)
+	if !s.allow(w, r, "invites:"+currentUser(r).ID, limitInvitesPerUser, windowInvites) {
+		return
+	}
 	kind := body.GameKind
 	if kind == "" {
 		kind = "this_or_that"
@@ -67,6 +71,12 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request, targetID, 
 		WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
 		return
 	}
+	s.notifyPush(ctx, targetID, push.Message{
+		Title: "Someone wants to play",
+		Body:  "You have two minutes to accept.",
+		URL:   "/home",
+		Tag:   "invite",
+	})
 	WriteJSON(w, http.StatusOK, item)
 }
 

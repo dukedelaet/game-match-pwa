@@ -33,6 +33,9 @@ func (s *Server) sessionJoin(w http.ResponseWriter, r *http.Request) {
 func (s *Server) sessionShow(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	u := currentUser(r)
+	if !s.allow(w, r, "poll:"+u.ID, limitSessionPollPerUser, windowSessionPoll) {
+		return
+	}
 	id := idParam(r)
 	if err := s.Engine.Heartbeat(ctx, id, u.ID); err != nil {
 		notFound(w)
@@ -63,6 +66,10 @@ func (s *Server) sessionAnswer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.Engine.Answer(ctx, id, u.ID, payload); err != nil {
+		if errors.Is(err, game.ErrNotYourTurn) {
+			WriteError(w, http.StatusForbidden, "not_your_turn", "It is not your turn")
+			return
+		}
 		if errors.Is(err, game.ErrClosed) {
 			WriteError(w, http.StatusConflict, "closed", "Not accepting answers")
 			return
