@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"reflect"
+	"sort"
+	"strings"
 
 	"gamematch/internal/store"
 )
@@ -16,14 +18,20 @@ type Score struct {
 	Components map[string]any
 }
 
-// ScoreSession ports Scorer::scoreSession. It returns nil for practice
-// sessions or sessions without exactly two participants.
+// chip is a candidate reason with its ranking weight.
+type chip struct {
+	label string
+	rank  float64
+}
+
+// ScoreSession ports scorer_v0. It returns nil for practice sessions and for
+// sessions without exactly two participants.
 func (e *Engine) ScoreSession(ctx context.Context, sessionID string) (*Score, error) {
 	ses, err := e.Store.GetSession(ctx, sessionID)
 	if err != nil {
 		return nil, err
 	}
-	if ses.Mode == "practice" {
+	if ses.Mode == modePractice {
 		return nil, nil
 	}
 	parts, err := e.Store.Participants(ctx, sessionID)
@@ -43,45 +51,61 @@ func (e *Engine) ScoreSession(ctx context.Context, sessionID string) (*Score, er
 	if err != nil {
 		return nil, err
 	}
-	ta, _ := e.Store.TraitIDsFor(ctx, a)
-	tb, _ := e.Store.TraitIDsFor(ctx, b)
-	jTraits := jaccard(ta, tb)
 
-	ia, _ := e.Store.IntentsFor(ctx, a)
-	ib, _ := e.Store.IntentsFor(ctx, b)
-	jInt := jaccard(ia, ib)
-
-	rounds, err := e.Store.RoundsFor(ctx, sessionID)
+	axesA, err := e.Store.TraitSlugsByAxis(ctx, a)
 	if err != nil {
 		return nil, err
 	}
-	same, n := 0, 0
-	type roundAnswers struct {
-		round   store.Round
-		answers []store.RoundAnswer
+	axesB, err := e.Store.TraitSlugsByAxis(ctx, b)
+	if err != nil {
+		return nil, err
 	}
-	var perRound []roundAnswers
-	for _, r := range rounds {
-		ans, err := e.Store.AnswersForRound(ctx, r.ID)
-		if err != nil {
-			return nil, err
-		}
-		perRound = append(perRound, roundAnswers{round: r, answers: ans})
-		if len(ans) < 2 {
-			continue
-		}
-		n++
-		if jsonEqual(ans[0].Payload, ans[1].Payload) {
-			same++
-		}
+	tagsA, err := e.pickedTags(ctx, a)
+	if err != nil {
+		return nil, err
 	}
-	behavior := 0.5
-	if n > 0 {
-		behavior = float64(same) / float64(n)
+	tagsB, err := e.pickedTags(ctx, b)
+	if err != nil {
+		return nil, err
 	}
-	loc := 0.0
-	if ua.MetroID != nil && ub.MetroID != nil && *ua.MetroID == *ub.MetroID {
-		loc = 0.6
+	gamesA, err := e.Store.FavoriteGames(ctx, a)
+	if err != nil {
+		return nil, err
+	}
+	gamesB, err := e.Store.FavoriteGames(ctx, b)
+	if err != nil {
+		return nil, err
+	}
+
+	// P = personality traits; L = lifestyle traits + lifestyle.* picks;
+	// I = interest traits + favorite games + interest.* picks.
+	setP := func(axes map[string][]string) []string { return axes["personality"] }
+	jP := jaccardStrict(setP(axesA), setP(axesB))
+	lA := union(axesA["lifestyle"], keysWithPrefix(tagsA, "lifestyle."))
+	lB := union(axesB["lifestyle"], keysWithPrefix(tagsB, "lifestyle."))
+	jL := jaccardStrict(lA, lB)
+	iA := union(axesA["interest"], gamesA, keysWithPrefix(tagsA, "interest."))
+	iB := union(axesB["interest"], gamesB, keysWithPrefix(tagsB, "interest."))
+	jI := jaccardStrict(iA, iB)
+
+	statsA, err := e.Store.BehaviorStatsFor(ctx, a)
+	if err != nil {
+		return nil, err
+	}
+	statsB, err := e.Store.BehaviorStatsFor(ctx, b)
+	if err != nil {
+		return nil, err
+	}
+	bSim, observedDims := behaviorSim(vectorFor(statsA), vectorFor(statsB))
+
+	location := 0.0
+	if ua.MetroID != nil && ub.MetroID != nil {
+		switch {
+		case *ua.MetroID == *ub.MetroID:
+			location = 1.0
+		case e.adjacentMetro(ctx, *ua.MetroID, *ub.MetroID):
+			location = 0.5
+		}
 	}
 
 	const (
@@ -91,7 +115,7 @@ func (e *Engine) ScoreSession(ctx context.Context, sessionID string) (*Score, er
 		wB = 0.1875
 		wG = 0.0625
 	)
-	score := wP*jTraits + wI*jInt + wL*jTraits + wB*behavior + wG*loc
+	score := wP*jP + wI*jI + wL*jL + wB*bSim + wG*location
 	if score < 0 {
 		score = 0
 	}
@@ -99,41 +123,113 @@ func (e *Engine) ScoreSession(ctx context.Context, sessionID string) (*Score, er
 		score = 1
 	}
 
+	// Walk the session once for signals, the same-energy count, and GMA accuracy.
+	rounds, err := e.Store.RoundsFor(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	type roundAnswers struct {
+		round   store.Round
+		answers []store.RoundAnswer
+	}
+	perRound := make([]roundAnswers, 0, len(rounds))
+	sameRounds := 0
+	gmaGuesses, gmaCorrect := 0, 0
+	for _, round := range rounds {
+		answers, err := e.Store.AnswersForRound(ctx, round.ID)
+		if err != nil {
+			return nil, err
+		}
+		perRound = append(perRound, roundAnswers{round: round, answers: answers})
+		if len(answers) < 2 {
+			continue
+		}
+		if jsonEqual(answers[0].Payload, answers[1].Payload) {
+			sameRounds++
+		}
+		if roles, ok := gmaFor(round); ok {
+			secret := answerFor(answers, roles.Answerer)
+			guess := answerFor(answers, roles.Guesser)
+			if secret != nil && guess != nil {
+				gmaGuesses++
+				if guessIsCorrect(secret.Payload, guess.Payload) {
+					gmaCorrect++
+				}
+			}
+		}
+	}
+
+	// Reasons, ranked by the table in §Reason copy.
+	chips := []chip{}
+	if jL >= 0.5 {
+		chips = append(chips, chip{"Similar lifestyle", wL * jL})
+	}
+	if bSim >= 0.7 && observedDims > 0 {
+		chips = append(chips, chip{"Similar game style", wB * bSim})
+	}
+	if jP >= 0.3 && contains(setP(axesA), "funny") && contains(setP(axesB), "funny") {
+		chips = append(chips, chip{"Same humor", wP * jP})
+	}
+	if gmaGuesses > 0 {
+		accuracy := float64(gmaCorrect) / float64(gmaGuesses)
+		if accuracy >= 0.5 {
+			chips = append(chips, chip{"Reads the room", wB * accuracy})
+		}
+	}
+	if jI >= 0.3 {
+		switch topShared := topSharedInterest(iA, iB); {
+		case strings.HasPrefix(topShared, "interest.music"):
+			chips = append(chips, chip{"Similar music", wI * jI})
+		case strings.HasPrefix(topShared, "interest.food"):
+			chips = append(chips, chip{"Similar food", wI * jI})
+		default:
+			chips = append(chips, chip{"Similar interests", wI * jI})
+		}
+	}
+	sort.SliceStable(chips, func(i, j int) bool { return chips[i].rank > chips[j].rank })
+
 	reasons := []string{}
-	if jTraits >= 0.3 {
-		reasons = append(reasons, "Similar vibe")
+	for i := 0; i < len(chips) && i < 3; i++ {
+		reasons = append(reasons, chips[i].label)
 	}
-	if behavior >= 0.5 {
-		reasons = append(reasons, "Same game energy")
-	}
-	if jInt >= 0.5 {
-		reasons = append(reasons, "Same reasons for being here")
-	}
-	if loc > 0 {
-		reasons = append(reasons, "Same city")
+	if sameRounds >= 3 {
+		// Same energy is a bonus: it slides in below the strongest chip, and
+		// otherwise takes the weakest slot.
+		if len(reasons) < 3 {
+			reasons = append(reasons, "Same energy")
+		} else {
+			reasons[len(reasons)-1] = "Same energy"
+		}
 	}
 	if len(reasons) == 0 {
 		reasons = []string{"Still getting to know you"}
 	}
-	if len(reasons) > 3 {
-		reasons = reasons[:3]
-	}
 
+	// A percent needs enough signal on both sides.
+	taggedA, err := e.Store.TaggedAnswerCount(ctx, a)
+	if err != nil {
+		return nil, err
+	}
+	taggedB, err := e.Store.TaggedAnswerCount(ctx, b)
+	if err != nil {
+		return nil, err
+	}
 	var percent *int
-	if n >= 6 {
+	if taggedA >= 8 && taggedB >= 8 {
 		p := int(score*100 + 0.5)
 		percent = &p
 	}
 
-	for _, pr := range perRound {
-		roles, isGMA := gmaFor(pr.round)
+	// Behaviour signals, one per answered round.
+	for _, entry := range perRound {
+		roles, isGMA := gmaFor(entry.round)
 		for _, uid := range []string{a, b} {
-			for _, ans := range pr.answers {
-				if ans.UserID != uid {
+			for _, answer := range entry.answers {
+				if answer.UserID != uid {
 					continue
 				}
-				sid := sessionID
-				value := ans.Payload
+				identifier := sessionID
+				value := answer.Payload
 				kind := "choice"
 				if isGMA {
 					switch uid {
@@ -142,14 +238,14 @@ func (e *Engine) ScoreSession(ctx context.Context, sessionID string) (*Score, er
 					case roles.Guesser:
 						kind = "gma_guess"
 						correct := false
-						if secret := answerFor(pr.answers, roles.Answerer); secret != nil {
-							correct = guessIsCorrect(secret.Payload, ans.Payload)
+						if secret := answerFor(entry.answers, roles.Answerer); secret != nil {
+							correct = guessIsCorrect(secret.Payload, answer.Payload)
 						}
 						encoded, _ := json.Marshal(map[string]bool{"correct": correct})
 						value = string(encoded)
 					}
 				}
-				if err := e.Store.InsertSignalEvent(ctx, uid, &sid, kind, "round."+itoa(pr.round.RoundIndex), &value); err != nil {
+				if err := e.Store.InsertSignalEvent(ctx, uid, &identifier, kind, "round."+itoa(entry.round.RoundIndex), &value); err != nil {
 					return nil, err
 				}
 			}
@@ -157,14 +253,14 @@ func (e *Engine) ScoreSession(ctx context.Context, sessionID string) (*Score, er
 	}
 
 	components := map[string]any{
-		"personality": jTraits,
-		"interests":   jInt,
-		"lifestyle":   jTraits,
-		"behavior":    behavior,
-		"location":    loc,
+		"personality": jP,
+		"interests":   jI,
+		"lifestyle":   jL,
+		"behavior":    bSim,
+		"location":    location,
 		"percent":     percent,
 	}
-	compJSON, err := json.Marshal(components)
+	componentsJSON, err := json.Marshal(components)
 	if err != nil {
 		return nil, err
 	}
@@ -172,58 +268,22 @@ func (e *Engine) ScoreSession(ctx context.Context, sessionID string) (*Score, er
 	if err != nil {
 		return nil, err
 	}
-	sessionIDCopy := sessionID
-	snap := &store.Snapshot{
-		SessionID:  sessionIDCopy,
+	snapshot := &store.Snapshot{
+		SessionID:  sessionID,
 		UserA:      a,
 		UserB:      b,
 		Score:      score,
-		Components: ptr(string(compJSON)),
+		Components: ptr(string(componentsJSON)),
 		Reasons:    ptr(string(reasonsJSON)),
 	}
-	if err := e.Store.InsertSnapshot(ctx, snap); err != nil {
+	if err := e.Store.InsertSnapshot(ctx, snapshot); err != nil {
+		return nil, err
+	}
+	if err := e.Store.UpsertPairScore(ctx, a, b, snapshot.ID); err != nil {
 		return nil, err
 	}
 
 	return &Score{Score: score, Percent: percent, Reasons: reasons, Components: components}, nil
-}
-
-// guessIsCorrect reports whether a Guess My Answer guess matched the secret.
-func guessIsCorrect(secret, guess string) bool {
-	var s, g struct {
-		OptionID string `json:"optionId"`
-	}
-	if json.Unmarshal([]byte(secret), &s) != nil || json.Unmarshal([]byte(guess), &g) != nil {
-		return false
-	}
-	return s.OptionID != "" && s.OptionID == g.OptionID
-}
-
-func jaccard(a, b []string) float64 {
-	if len(a) == 0 && len(b) == 0 {
-		return 0.5
-	}
-	set := map[string]bool{}
-	for _, x := range a {
-		set[x] = true
-	}
-	inter := 0
-	for _, x := range b {
-		if set[x] {
-			inter++
-		}
-	}
-	unionSet := map[string]bool{}
-	for _, x := range a {
-		unionSet[x] = true
-	}
-	for _, x := range b {
-		unionSet[x] = true
-	}
-	if len(unionSet) == 0 {
-		return 0
-	}
-	return float64(inter) / float64(len(unionSet))
 }
 
 // jsonEqual compares two JSON documents by value (order-insensitive).
@@ -236,6 +296,17 @@ func jsonEqual(a, b string) bool {
 		return a == b
 	}
 	return reflect.DeepEqual(av, bv)
+}
+
+// guessIsCorrect reports whether a Guess My Answer guess matched the secret.
+func guessIsCorrect(secret, guess string) bool {
+	var s, g struct {
+		OptionID string `json:"optionId"`
+	}
+	if json.Unmarshal([]byte(secret), &s) != nil || json.Unmarshal([]byte(guess), &g) != nil {
+		return false
+	}
+	return s.OptionID != "" && s.OptionID == g.OptionID
 }
 
 func ptr[T any](v T) *T { return &v }

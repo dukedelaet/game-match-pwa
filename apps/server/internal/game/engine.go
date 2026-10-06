@@ -411,6 +411,10 @@ func (e *Engine) complete(ctx context.Context, ses store.GameSession) error {
 	if err := e.Store.UpdateSession(ctx, ses); err != nil {
 		return err
 	}
+	// Materialize behaviour stats before scoring so this session counts.
+	if err := e.recordBehavior(ctx, ses); err != nil {
+		return err
+	}
 	if _, err := e.ScoreSession(ctx, ses.ID); err != nil {
 		return err
 	}

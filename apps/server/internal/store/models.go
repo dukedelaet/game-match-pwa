@@ -49,6 +49,20 @@ type Trait struct {
 	Label string  `db:"label"`
 	Emoji *string `db:"emoji"`
 	Sort  int     `db:"sort"`
+	Axis  string  `db:"axis"`
+}
+
+// BehaviorStats holds the counters behind the scorer's behavior vector.
+type BehaviorStats struct {
+	UserID       string `db:"user_id"`
+	RiskN        int    `db:"risk_n"`
+	RiskSum      int    `db:"risk_sum"`
+	TempoN       int    `db:"tempo_n"`
+	TempoFast    int    `db:"tempo_fast"`
+	RematchN     int    `db:"rematch_n"`
+	RematchYes   int    `db:"rematch_yes"`
+	GuessN       int    `db:"guess_n"`
+	GuessCorrect int    `db:"guess_correct"`
 }
 
 type Profile struct {
