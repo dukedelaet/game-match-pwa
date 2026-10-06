@@ -12,15 +12,11 @@ import {
 import { api, type Me } from './api'
 import { useInstallPrompt } from './useInstallPrompt'
 
-let meCache: Me | null = null
-
 async function requireUser() {
   try {
     const { user } = await api.get('/v1/auth/session')
-    meCache = user
     return user as Me
   } catch {
-    meCache = null
     throw redirect({ to: '/' })
   }
 }
@@ -57,7 +53,6 @@ function Welcome() {
     setErr('')
     try {
       const r = await api.post('/v1/auth/otp/verify', { phone, code })
-      meCache = r.user
       nav({ to: r.user.onboardingStep === 'done' ? '/home' : '/onboarding' })
     } catch (e: any) {
       setErr(e.message)
@@ -83,7 +78,6 @@ function Welcome() {
             className="w-full rounded-2xl bg-white py-3 font-bold text-black"
             onClick={async () => {
               const r = await api.post('/v1/auth/oauth/apple')
-              meCache = r.user
               nav({ to: r.user.onboardingStep === 'done' ? '/home' : '/onboarding' })
             }}
           >
@@ -93,7 +87,6 @@ function Welcome() {
             className="w-full rounded-2xl bg-white/10 py-3 font-bold"
             onClick={async () => {
               const r = await api.post('/v1/auth/oauth/google')
-              meCache = r.user
               nav({ to: r.user.onboardingStep === 'done' ? '/home' : '/onboarding' })
             }}
           >
