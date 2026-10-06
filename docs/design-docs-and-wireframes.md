@@ -5,14 +5,14 @@
 | **Title** | GameMatch: play-first dating PWA |
 | **Author** | TBD (product + engineering) |
 | **Date** | 2026-08-26 |
-| **Status** | Draft (revision 7 — Hostinger PHP/MySQL stack override) |
+| **Status** | Draft (revision 8 — Go/SQLite backend) |
 | **Related concepts** | GameMatch (consumer app); Project MatchPoint (barcade + lounge, venue SaaS) |
 | **Source material** | Informal GitHub issue #1 notes (wireframes; described as truncated at §28 — **not in git**); GitHub issue #2 investor/venue proposal |
 | **Repo** | `game-match-pwa`. **On disk:** `README.md` + `docs/` (this file + `business-proposal.md`). **Git tracks only `README.md` as of this writing.** No application code, lockfile, or stack in the tree. |
 
 This document is the spec of record at `docs/design-docs-and-wireframes.md`. Informal issue notes are not the body of record. Do not assume issue #1 exists in git history.
 
-**How to read decisions:** [Key Decisions](#key-decisions) are **locked for v1**. **OQ-1, OQ-4, and OQ-28 were answered by the user on 2026-08-26** and are final. **OQ-12 / OQ-13 were overridden 2026-08-26:** React PWA + PHP + MySQL on Hostinger Business (not Fly/Hono/Postgres/Redis). Remaining Confirm-the-KD items stay in force. Remaining Open Questions are Later / non-schema.
+**How to read decisions:** [Key Decisions](#key-decisions) are **locked for v1**. **OQ-1, OQ-4, and OQ-28 were answered by the user on 2026-08-26** and are final. **OQ-12 / OQ-13 were overridden 2026-08-26:** React PWA + server API (originally PHP + MySQL; backend ported to Go + SQLite on 2026-10-06). Remaining Confirm-the-KD items stay in force. Remaining Open Questions are Later / non-schema.
 
 ---
 
@@ -96,9 +96,9 @@ Locked for v1. Confirm-the-KD questions in Open Questions do **not** reopen thes
 | **KD-4** | **No public availability labels** in product UI or TV copy: never “single”, “rejected”, “unmatched”, “who passed”. Venue presence (v2) is opt-in and coarse (“At THE HIVE”). **Venue “Singles Night” is event marketing copy, not a guest flag or in-app label.** No TV “WHO’S SINGLE?”. | **OQ-28 resolved 2026-08-26: kill in-product “WHO’S SINGLE?”.** |
 | **KD-5** | **`scorer_v0` is a documented pure function.** Show reason chips; show percent **only after a completed shared game** and only if both have enough signals. **No 50–99 clamp.** Percent = `round(score * 100)` of renormalized 0–1. | Fake clamp was dishonest (R3). |
 | **KD-6** | **Do not score** attractiveness, race, body, income, exact GPS, win rate as desirability, XP/matches, orientation-as-bonus. | Ethics + anti-popularity-spiral. |
-| **KD-7** | **HTTPS REST + short-poll** for sessions, chat, presence, queue. **No WebSocket in v1.** Game deadlines are server `answer_by` timestamps; clients poll `GET /sessions/:id` at 1 Hz while a round is open. | Hostinger Business shared PHP has no durable WS process. |
-| **KD-8** | **MySQL** is the system of record **and** the ephemeral store (queue rows, session docs, presence). **No Redis.** Append-only `signal_events`. | Hostinger web hosting: MySQL yes; Redis/Postgres require VPS. |
-| **KD-9** | **v1 stack locked (user override 2026-08-26):** Vite + React 19 + TypeScript PWA, **TanStack Router**, TanStack Query, Zustand, Tailwind, `vite-plugin-pwa`, pnpm for `apps/web`. **PHP 8.3 + Laravel 11** as the API/middleware (`apps/api`): Sanctum SPA cookies, Eloquent, scheduler. **MySQL 8** on Hostinger. Auth: **Laravel Sanctum** + Twilio OTP + Socialite (Apple/Google). Photos on **Hostinger disk**. **Host: Hostinger Business** (same origin: static PWA + PHP `/v1`). Composer for PHP. **No Fly, no Hono, no Postgres, no Redis, no R2, no Better Auth.** | User: serve the React PWA against PHP middleware on MySQL, all on Hostinger Business. |
+| **KD-7** | **HTTPS REST + short-poll** for sessions, chat, presence, queue. **No WebSocket in v1.** Game deadlines are server `answer_by` timestamps; clients poll `GET /sessions/:id` at 1 Hz while a round is open. | Short-poll keeps the service a single stateless process. |
+| **KD-8** | **SQLite** is the system of record **and** the ephemeral store (queue rows, session docs, presence). **No Redis.** Append-only `signal_events`. | One file, WAL; no separate database service. |
+| **KD-9** | **v1 stack (backend ported to Go 2026-10-06):** Vite + React 19 + TypeScript PWA, **TanStack Router**, TanStack Query, Zustand, Tailwind, `vite-plugin-pwa`, pnpm for `apps/web`. **Go** (`apps/server`): chi router, `net/http` middleware, `sqlx` + hand-written SQL, cookie sessions. **SQLite** (WAL) as the store. Auth: phone OTP + cookie session (demo OAuth stand-ins). Photos on local disk. One origin: static PWA + Go `/v1`. **No Fly, no Postgres, no Redis.** | User: React PWA against a single-binary Go service. |
 | **KD-10** | **App age floor 18.** Venue 21+ is door policy, not the PWA SKU. Self-attest + DOB in v1. Counsel before public. | **OQ-4 resolved 2026-08-26: 18+.** |
 | **KD-11** | **v1 matcher is metro-scoped, not mile-radii.** Catalog `metros` (centroid/bbox/adjacent **admin-only, never in public JSON**). User picks a metro; optional one-shot geo only **suggests** which metro (then dropped). Preference: `distance_scope` = `metro` \| `metro_and_adjacent`. Optional `approx_geohash` precision 5 may be stored for a later mile-band feature; **v1 does not haversine it.** Never persist raw GPS, never log lat/lng. | City-picker users share a centroid hash; fake 10/25/50 mile UI would be a no-op. |
 | **KD-12** | **Primary job is dating.** If **either** user has intent `dating`, **both** must have `dating`. Dating+Gaming may pair with Dating-only. Dating must **not** pair with Friendship-only or Gaming-only. Socializing is **not** a bridge into the dating pool. If **neither** has `dating`, Friendship / Gaming / Socializing may pair (non-dating pool). Normative `intentsOk` lives next to `genderOk`. | **OQ-1 resolved 2026-08-26: dating-with-games.** Friendship/Gaming are secondary. |
@@ -108,10 +108,10 @@ Locked for v1. Confirm-the-KD questions in Open Questions do **not** reopen thes
 | **KD-16** | XP/levels/badges **participation-based**, server-authoritative, not a matcher input. | Source §20–21. |
 | **KD-17** | **English, one US metro** at a time (allowlist). | No i18n platform. |
 | **KD-18** | **In-app brand: GameMatch.** MatchPoint = venue/investor name. | One chrome. |
-| **KD-19** | **Matcher: minimize wait, no score floor.** On every `POST /queue` and `GET /queue/status`: hard-filter (including `distance_scope`) → take **best of k=5** by `scorer_v0` pair score, or **0.5** if percent would be hidden. If pool empty, **expand to adjacent metros** (even if a user chose `metro` only) after **32s wait** (from `queue_entries.enqueued_at`). Never violate block/intent/age/gender/incognito/cooldown. No background 8s daemon. | Cold start; Hostinger has no always-on matcher loop. |
+| **KD-19** | **Matcher: minimize wait, no score floor.** On every `POST /queue` and `GET /queue/status`: hard-filter (including `distance_scope`) → take **best of k=5** by `scorer_v0` pair score, or **0.5** if percent would be hidden. If pool empty, **expand to adjacent metros** (even if a user chose `metro` only) after **32s wait** (from `queue_entries.enqueued_at`). Never violate block/intent/age/gender/incognito/cooldown. No background 8s daemon. | Cold start; matching runs on queue POST/poll, with no always-on matcher loop. |
 | **KD-20** | **Targeted play = `POST /v1/invites`** `{ targetUserId, gameKind }` only if the pair has a **prior completed session, open pair_relationship, or mutual match**. TTL 2 min. **No cold invite of strangers. No production debug pair-by-id.** `staff.force_pair` **on in staging only, off in beta/prod**. | Makes Play-with-Alex real without a deck. |
 | **KD-21** | **Gender / who-to-meet:** optional self-label from `genders` catalog (including “prefer not to say”); **`who_to_meet` multi-select** of gender ids **or** `open` (= everyone). **No default heterosexual pairing.** Orientation is **not collected in v1**. Matcher applies **each side independently**: if A is not open, B.`gender_id` must be in A’s list (**null gender on B → no match**). If A is open, A imposes no gender constraint. Same for B. **Do not skip B’s filter because A is open.** Empty `who_to_meet` with `who_to_meet_open=true` is the default. | Choosier user’s list is never discarded. |
-| **KD-22** | **One Hostinger site is the origin.** Document root serves the Vite PWA; Laravel handles `/v1/*`. **Sanctum SPA session cookie** (`httpOnly`, `Secure`, `SameSite=Strict`, same origin). No access JWT, no `/ws`, no CORS for the PWA. **Signed photo GET URLs TTL 10 minutes** (Laravel signed routes over files on disk). Messages **plain text**. CSP: `default-src 'self'`; `script-src 'self' https://challenges.cloudflare.com` (Turnstile); `connect-src 'self' https://*.sentry.io`; `img-src 'self' blob:`; `frame-src https://challenges.cloudflare.com`. Optional `www` redirect to `app`. | Same host is what Hostinger Business actually gives you. |
+| **KD-22** | **One origin serves both.** Document root serves the Vite PWA; Go handles `/v1/*`. **session cookie** (`httpOnly`, `Secure`, `SameSite=Lax`, same origin). No access JWT, no `/ws`, no CORS for the PWA. **Photo GET requires the session cookie** (served from disk). Messages **plain text**. CSP: `default-src 'self'`; `script-src 'self' https://challenges.cloudflare.com` (Turnstile); `connect-src 'self' https://*.sentry.io`; `img-src 'self' blob:`; `frame-src https://challenges.cloudflare.com`. Optional `www` redirect to `app`. | One origin serves the PWA and `/v1`. |
 | **KD-23** | **20 Questions v1 = 4-choice pick-list**, not free text. | OQ-10/OQ-23: no mod staff on day one. |
 | **KD-24** | **Percents never on HOME or queue.** Queue shows wait estimate only, never “82% potential.” | Demand + identity leak. |
 | **KD-25** | **Connect is per unordered pair.** `pair_relationships.id` is UUIDv7. `POST /pairs/:pairId/connect`. Latest **completed** human session can Connect/Pass. Forfeit/cancelled/practice cannot. **`matches` is one row per pair for life** (`UNIQUE (user_a,user_b)`). Mutual = `INSERT … ON DUPLICATE KEY UPDATE` (`state=mutual`, new `origin_session_id`/`expires_at`, clear `unmatched_by`). **One `chat_threads` row per match**; reopen on rematch (`state=open`) with a `kind=system` divider — do not insert a second thread and do not pretend the unmatched window never happened. Icebreaker fires on **transition into mutual**, not on SQL insert. New completed human session while `unmatched\|expired\|closed` and cooldown past: `state=open_play`, `a_action=b_action=none`, `pending_expires_at=null`. Pair `state` is pair-centric (`open_play\|pending\|mutual\|closed\|unmatched\|expired\|blocked`). | Second Mutual must not UNIQUE-crash; leftover Pass must not block Connect. |
@@ -119,7 +119,7 @@ Locked for v1. Confirm-the-KD questions in Open Questions do **not** reopen thes
 | **KD-27** | **Feature flags + phone allowlist ship before onboarding is public** (PR train). Dogfood requires flags + delete + reports, not only the happy loop. | Prevents open OTP+photos with no gate. |
 | **KD-28** | **Block is bidirectional hide** for queue, invites, profile GET, session join, chat, HOME, **`GET /pairs`, `GET /pairs/:id`, `GET /home` pending/invites, Connect.** Notified: never. `assertNotBlocked(a,b)` iff no `blocks` row either direction. If a `matches` row exists, set `matches.state=blocked` and **lock the thread** (same as unmatch). **Not a Pass** (no `closed` / no “you passed” row for the other party). **Unblock:** delete your row; if the other still blocks you, still blocked. When **no** block remains: `matches.state=unmatched`, pair `state=unmatched`, `cooldown_until=now()+14d`, thread stays locked until they play after cooldown (unmatched-equivalent, not immediate invite). | MATCH faces must not survive a block. |
 | **KD-29** | **Photo v1 pipeline:** MIME/magic sniff, size cap, **server re-encode WebP**, **strip EXIF/GPS**, 1080 + 320 + blurhash. CSAM/underage report → **immediate freeze**. Counsel + NCMEC **18 U.S.C. §2258A** path before **public** launch (not required to invent legal copy in engineering PRs). | Closed beta still stores photos. |
-| **KD-30** | **v1 game authority is request-driven PHP + MySQL session rows (TTL 2h).** Each poll/POST loads the row, applies deadlines, writes, returns `RoundView`. PHP workers are on-demand (no long-lived daemon). Matcher runs **on queue POST/poll** (enqueue time drives the 8s/32s expand). Hostinger cron (`* * * * * php artisan schedule:run`) is the backstop for forfeits, expiry, and starve — **not** the 8s game clock. | Shared hosting cannot keep a Node/WS process alive. |
+| **KD-30** | **v1 game authority is request-driven Go + SQLite session rows (TTL 2h).** Each poll/POST loads the row, applies deadlines, writes, returns `RoundView`. The matcher runs **on queue POST/poll** (enqueue time drives the 8s/32s expand). An in-process ticker is the backstop for forfeits and expiry — **not** the 8s game clock. | No long-lived per-game process is needed. |
 | **KD-31** | **Account deletion:** immediate PII wipe **unless** a **legal hold** is active. Hold is created on `csam`/`underage` report (freeze). `DELETE /me` then returns **409** until mod/counsel releases the hold. Held: encoded photos + cited `message_ids` + report row, TTL **90 days after hold release** (or 1 year from report, whichever first). Otherwise: wipe profile/photos/bodies/DOB/email/encrypted phone; tombstone `users.id`; banned `phone_e164_hash` 12 months; other open reports 90 days then subject nulled. **No 30-day cool-off.** | Wipe must not beat CSAM evidence. |
 | **KD-32** | **Public `last_active_on` is a UTC date**, not a minute timestamp. Internal `last_seen_at` is not in public APIs. | Presence stalking. |
 | **KD-33** | **Supported clients:** Chrome/Android (installable), **Safari iOS 16.4+ Add to Home Screen**, desktop Chromium **best-effort**. SMS/email **not** used for match notify in v1 (Web Push + in-app only). | iOS limits; no extra vendor. |
@@ -140,12 +140,12 @@ flowchart LR
     TV[TV director]
     ADM[Venue admin]
   end
-  PWA --> API[GameMatch PHP /v1]
+  PWA --> API[GameMatch Go /v1]
   VEN -.-> API
   TAB -.-> API
   TV -.-> API
   ADM -.-> API
-  API --> DB[(MySQL)]
+  API --> DB[(SQLite)]
 ```
 
 ### Screen inventory (v1)
@@ -439,7 +439,7 @@ Estimated wait: ~30 seconds
 [ CANCEL ]
 ```
 
-At **30s**: show `[ PRACTICE VS HOUSE ]` (KD-26). At **90s**: copy “Still quiet. Keep waiting or practice.” buttons `[ KEEP WAITING ]` `[ PRACTICE ]`. Keep-waiting stays in the same MySQL `queue_entries` row; no match is faked. **No** “Potential matches 82%” bar.
+At **30s**: show `[ PRACTICE VS HOUSE ]` (KD-26). At **90s**: copy “Still quiet. Keep waiting or practice.” buttons `[ KEEP WAITING ]` `[ PRACTICE ]`. Keep-waiting stays in the same `queue_entries` row; no match is faked. **No** “Potential matches 82%” bar.
 
 ### Deferred v2 wireframes
 
@@ -531,7 +531,7 @@ stateDiagram-v2
 - **Countdown:** 3s (`countdown_ms=3000`).
 - **RevealRound dwell:** 4s then next (`reveal_ms=4000`).
 - **Poll grace:** 15s without `GET /sessions/:id` or heartbeat POST → forfeit. Tab-switch is OK if the PWA keeps polling; background iOS will forfeit (honest).
-- **MySQL session row TTL 2h.** Authority loads the row; if missing and not already terminal, session **forfeit**.
+- **Session row TTL 2h.** Authority loads the row; if missing and not already terminal, session **forfeit**.
 - **Play Again 30s:** both still on S11 → new session `mode=invite` auto-accepted. If one left: remaining client `POST /invites`.
 
 ### Chat thread
@@ -549,35 +549,35 @@ flowchart TB
     SW[Service worker]
     Push[Web Push]
   end
-  subgraph hostinger [Hostinger Business]
-    WEB[Apache/LiteSpeed static PWA]
-    PHP[PHP 8.3 Laravel /v1 middleware]
-    CRON[Cron schedule:run every 1 min]
+  subgraph server [Go server]
+    WEB[static PWA]
+    API[Go /v1 service]
+    TICK[in-process ticker every 5s]
   end
   subgraph data [Data]
-    DB[(MySQL 8)]
+    DB[(SQLite file, WAL)]
     DISK[Local disk photos]
   end
   PWA --> WEB
-  PWA --> PHP
-  PHP --> DB
-  PHP --> DISK
-  CRON --> PHP
+  PWA --> API
+  API --> DB
+  API --> DISK
+  TICK --> API
 ```
 
-**v1 process model (KD-30):** Laravel request = the process. Middleware stack: Sanctum session → throttle → feature flags → route. Game authority and `scorer_v0` run **inside the request that closes a round or completes a session** (still synchronous before the JSON body). Matcher runs on `POST /queue` and `GET /queue/status`. Photo encode is **synchronous GD/Imagick in the upload request** (no second worker machine). Hostinger cron is expiry/forfeit backstop only.
+**v1 process model:** the Go binary owns both the HTTP server and the game state. Middleware: cookie session → route. Game authority and `scorer_v0` run **inside the request that closes a round or completes a session** (synchronous, before the JSON body is written). The matcher runs on `POST /queue` and `GET /queue/status`. Photo encode is **synchronous in the upload request**. An in-process ticker (every 5s) is the expiry/forfeit backstop; a player's own poll also advances their session.
 
-**Authoritative game state in MySQL.** Clients render. Deadlines are `answer_by` ISO from server clock.
+**Authoritative game state in SQLite.** Clients render. Deadlines are `answer_by` ISO from the server clock.
 
-**Hostinger Business limits (normative):** ~2 vCPU, 3 GB RAM, 50 GB NVMe, 60 PHP workers, 75 MySQL connections/user, 3 GB DB size, PHP max execution 360s. Redis/Postgres **not** on this plan. Node.js “web apps” on Business **sleep when idle** — do **not** use them for game authority.
+**Deployment:** one Go process owns one SQLite writer. State transitions serialize behind an engine mutex, so a single instance is the intended deployment; scale up before scaling out.
 
 ### Expected load (planning)
 
-`ASSUMPTION`: **5k registered**, **500 DAU**, **20 concurrent game sessions**, chat **< 5 msgs/s**. Stay inside 60 PHP workers: in-round poll is **1 Hz per player**, not faster.
+`ASSUMPTION`: **5k registered**, **500 DAU**, **20 concurrent game sessions**, chat **< 5 msgs/s**. Keep in-round poll at **1 Hz per player**, not faster.
 
 | Resource | Estimate |
 | --- | --- |
-| MySQL | plan cap **3 GB** per DB; year-1 target **< 2 GB** |
+| SQLite | single file; year-1 target **< 2 GB** |
 | Signal events | ~45k rows/day at 500 DAU × 3 games |
 | Latency | REST p95 `< 500ms` (shared hosting) |
 | Photos | re-encoded WebP on disk; 3 sizes |
@@ -606,31 +606,35 @@ flowchart TB
 | Client data | TanStack Query + Zustand for live session (poll, not WS) |
 | PWA | `vite-plugin-pwa` |
 | Frontend pkg | pnpm `apps/web` |
-| API | **PHP 8.3 + Laravel 11** (`apps/api`) — HTTP middleware: Sanctum, throttle, flags |
-| PHP pkg | Composer |
-| Shared types | `packages/shared` TypeScript; PHP DTO mirrors in `app/Data` |
-| ORM | **Eloquent** |
-| DB | **MySQL 8** (Hostinger managed) |
-| Queue / cache | **MySQL tables** (`queue_entries`, `sessions`, `cache`); no Redis |
-| Files | Hostinger disk `storage/app/photos` |
-| Auth | **Laravel Sanctum SPA**; Twilio OTP; Socialite Apple/Google |
-| Host | **Hostinger Business** — one origin: static PWA + PHP `/v1` |
-| Cron | Hostinger cron every minute: `php artisan schedule:run` |
-| Obs | Sentry PHP + browser; Laravel logs |
-| Email | Hostinger SMTP — **transactional account only**, not match notify (100/day plan cap) |
+| API | **Go** (`apps/server`) — chi router, `net/http` middleware |
+| Go pkg | Go modules |
+| Shared types | `packages/shared` TypeScript |
+| ORM | none — `sqlx` + hand-written SQL in `internal/store` |
+| DB | **SQLite** (WAL), one file at `DATA_DIR/gamematch.db` |
+| Queue / cache | **SQLite tables** (`queue_entries`, `sessions`, `otp_codes`); no Redis |
+| Files | local disk `DATA_DIR/photos` |
+| Auth | **Cookie sessions** (opaque token) + OTP; demo OAuth stand-ins |
+| Host | one origin: static PWA + Go `/v1` |
+| Cron | in-process ticker (every 5s) advances sessions |
+| Obs | Go `log` output |
 
-**No WebSocket. No Redis. No Fly. No second compute process.** Node.js on Hostinger Business sleeps when idle — the PWA is a **static Vite build**, not a Node server.
+**No WebSocket. No Redis. No second process.** The PWA is a **static Vite build**; the Go binary serves `/v1` and owns the SQLite file.
+
+> **Superseded (2026-10-06):** the backend was ported from PHP 8.3 + Laravel +
+> MySQL to Go + SQLite. The rows above are current; the rest of this document
+> keeps its original wording where it describes product behavior, and any
+> leftover "PHP"/"MySQL" references should be read as the Go/SQLite service.
 
 **Hosting (normative with KD-22):**
 
 ```mermaid
 flowchart LR
-  User --> App["app.gamematch.example Hostinger"]
-  App --> SPA[Vite dist in public/]
-  App --> API["/v1 Laravel"]
-  API --> DB[(MySQL)]
+  User --> App["app.gamematch.example"]
+  App --> SPA[Vite dist]
+  App --> API["/v1 Go"]
+  API --> DB[(SQLite file)]
   API --> DISK[photos on disk]
-  Cron[cron every 1 min] --> API
+  Tick[in-process ticker] --> API
 ```
 
 ```ts
@@ -684,7 +688,7 @@ export type PairState =
 export interface SessionStateEvent {
   sessionId: string;
   state: SessionState;
-  resumeToken: string; // minted on successful session.join; MySQL sessions.ttl 2h
+  resumeToken: string; // minted on successful session.join; session ttl 2h
   youSeat: 0 | 1;
 }
 
@@ -715,7 +719,7 @@ export interface SessionCompleted {
 
 UUIDv7 PKs, `created_at`/`updated_at`. **v1 migrations = v1 tables only.** Venue comments allowed in SQL; **no `venues` / `venue_presences` tables until v2.**
 
-**MySQL 8 types (not Postgres):** `JSON` columns (MySQL has no `jsonb`); JSON arrays instead of `text[]`/`uuid[]`; `varchar` not `citext` (store email lowercased); `timestamp` stored UTC. InnoDB, `utf8mb4`. Upserts are `INSERT … ON DUPLICATE KEY UPDATE` (Eloquent `updateOrCreate`), not Postgres `ON CONFLICT`.
+**SQLite types:** UUIDs are `TEXT`; JSON is stored in `TEXT` columns; booleans are `INTEGER` 0/1; timestamps are RFC3339 `TEXT` in UTC. Upserts use `INSERT … ON CONFLICT(…) DO UPDATE`. Journal mode is WAL.
 
 ### ER (v1)
 
@@ -1049,8 +1053,8 @@ Shared:
 | Join | Both `POST /sessions/:id/join` within 30s of `pending` |
 | Countdown | 3s |
 | Disconnect | 15s without poll → forfeit |
-| Authority | MySQL `sessions` row; updated on each poll/POST |
-| Resume | `GET /sessions/:id` with Sanctum cookie; reload `RoundView` |
+| Authority | SQLite `game_sessions` row; updated on each poll/POST |
+| Resume | `GET /sessions/:id` with the session cookie; reload `RoundView` |
 | Seed | `sessions.config.seed` shuffles `prompt_bank` for kind |
 | Leave | `POST /sessions/:id/leave` → forfeit |
 
@@ -1118,11 +1122,11 @@ No HTML. Client labels on chips match those strings.
 | Chat | REST cursor history; poll **2s** while thread open |
 | Presence | Poll = heartbeat; expire 45s; **not** exposed as last-seen minute |
 | Push | Web Push: chat, mutual match, invite, queue found |
-| Score | In the PHP request that completes the session; body of `SessionCompleted` |
+| Score | In the Go request that completes the session; body of `SessionCompleted` |
 
 v1 **no WebSocket, no Redis pub/sub.**
 
-**Queues are per metro and game kind.** MySQL `queue_entries (metro_id, game_kind, user_id, enqueued_at)`. `POST /queue` with `this_or_that` never pops a `twenty_questions` waiter. Depth on HOME is **this_or_that** (the default button) unless the user is already queued for another kind.
+**Queues are per metro and game kind.** SQLite `queue_entries (metro_id, game_kind, user_id, enqueued_at)`. `POST /queue` with `this_or_that` never pops a `twenty_questions` waiter. Depth on HOME is **this_or_that** (the default button) unless the user is already queued for another kind.
 
 ### Sequence: queue 1:1 This-or-That
 
@@ -1130,8 +1134,8 @@ v1 **no WebSocket, no Redis pub/sub.**
 sequenceDiagram
   participant A as Client A
   participant B as Client B
-  participant API as PHP API
-  participant DB as MySQL
+  participant API as Go API
+  participant DB as SQLite
 
   A->>API: POST /v1/queue { gameKind }
   API->>DB: INSERT queue_entries
@@ -1163,7 +1167,7 @@ sequenceDiagram
 sequenceDiagram
   participant A as Client A
   participant B as Client B
-  participant API as PHP API
+  participant API as Go API
   A->>API: POST /v1/invites { targetUserId, gameKind }
   API->>API: eligible pair + assertNotBlocked
   B->>API: GET /home or GET /invites
@@ -1176,7 +1180,7 @@ sequenceDiagram
 ## API / interface sketch
 
 Base: `https://app.gamematch.example/v1` (same origin).  
-Auth: **Sanctum SPA cookie** (credentials include). No Bearer access JWT.  
+Auth: **Session cookie** (credentials include). No Bearer access JWT.  
 Idempotency-Key: queue, invites, connect, send message.
 
 Error body: `{ "error": { "code": "blocked", "message": "…" } }`.
@@ -1187,11 +1191,11 @@ Error body: `{ "error": { "code": "blocked", "message": "…" } }`.
 | --- | --- | --- |
 | POST | `/auth/otp/start` | always `{ ok: true }`; SMS only if allowlisted when `auth.public_signup=false` |
 | POST | `/auth/otp/verify` | allowlist if flag off |
-| POST | `/auth/oauth/:provider` | Socialite |
-| POST | `/auth/logout` | Sanctum invalidate |
+| POST | `/auth/oauth/:provider` | demo stand-in (apple/google) |
+| POST | `/auth/logout` | session invalidate |
 | GET | `/auth/session` | current user or 401 |
 
-Laravel Sanctum SPA: CSRF cookie on first hit (`GET /sanctum/csrf-cookie` if needed; same-origin Laravel may use session middleware only). OTP/OAuth live under `/v1/auth/*`. Do not mount `/api/auth/*`. **No WS ticket.**
+Cookie sessions: the server sets an opaque `gm_session` cookie on OTP/OAuth success; `/v1/*` needs no CSRF token. OTP/OAuth live under `/v1/auth/*`. Do not mount `/api/auth/*`. **No WS ticket.**
 
 ### Users
 
@@ -1306,7 +1310,7 @@ Expiry job: `matches.state=expired`, pair `state=expired`, `cooldown_until` **nu
 { sessionId: string; gameKind: GameKind }
 
 // GET /sessions/:id after join
-SessionStateEvent // resumeToken optional/ignored; Sanctum cookie is auth
+SessionStateEvent // resumeToken optional/ignored; session cookie is auth
 
 // in-round
 RoundView
@@ -1326,7 +1330,7 @@ SessionCompleted
 
 Client → server REST: `POST /sessions/:id/join`, `POST /sessions/:id/answer`, `POST /sessions/:id/heartbeat` (optional; GET also counts as heartbeat). **No `hello` ticket.**
 
-**Resume:** reopen the PWA → Sanctum cookie → `GET /sessions/:id`. If the row TTL **2h** expired or grace 15s passed → forfeit.
+**Resume:** reopen the PWA → session cookie → `GET /sessions/:id`. If the row TTL **2h** expired or grace 15s passed → forfeit.
 
 ### Safety
 
@@ -1356,7 +1360,7 @@ OTP start **always** `{ ok: true }` (no phone oracle). CAPTCHA after 2 IP failur
 ### Auth abuse
 
 - SIM-swap: phone change requires re-OTP + email if present + 24h lock on unmatch-all optional later; v1: re-OTP only, log security event.
-- SMS pumping: Twilio geo-permit US first (KD-17); kill switch flag `auth.otp=false`.
+- SMS pumping: geo-permit the launch region (KD-17); kill switch flag `auth.otp=false`. No SMS provider is wired in v1 (the dev code is returned as `devCode`).
 - Enumeration: generic OTP start; OAuth errors generic.
 
 ### Age
@@ -1389,11 +1393,11 @@ Takedown SLA: **24h** to remove CSAM once we accept the report; freeze is second
 
 ### Photo pipeline (KD-29)
 
-1. `POST /me/photos` multipart, max 10 MB. PHP handles the bytes (no S3 presign).
-2. Same request: magic bytes jpeg/png/webp/heic, reject other; strip EXIF; decode; max dimension 1080; WebP quality ~80; thumb 320; blurhash; write `storage/app/photos/ok/{user}/{id}`; delete tmp (GPS gone). GD or Imagick on Hostinger.
+1. `POST /me/photos` multipart, max 10 MB. The server handles the bytes (no S3 presign).
+2. Same request: magic bytes jpeg/png/webp/heic, reject other; strip EXIF; decode; max dimension 1080; WebP quality ~80; thumb 320; blurhash; write `storage/app/photos/ok/{user}/{id}`; delete tmp (GPS gone). Implemented with the Go `imaging` library.
 3. Fail → user sees retry; `moderation_state=rejected`.
 4. Onboarding Continue on S04 is disabled until **≥1 photo has `moderation_state=ok`**.
-5. Flag `photos.public=false` (default through closed beta): files not web-root browsable; **Laravel signed GET URLs expire in 10 minutes**; thumbs still shown to allowlisted session partners / MATCH. It does **not** hide opponent photos from a session partner.
+5. Flag `photos.public=false` (default through closed beta): files not web-root browsable; **photo GET URLs require the session cookie**; thumbs still shown to allowlisted session partners / MATCH. It does **not** hide opponent photos from a session partner.
 6. No PhotoDNA required to **dogfood**.
 
 ### Incognito
@@ -1461,13 +1465,13 @@ REST p95/5xx; poll 429s; **forfeit > 20%**; queue wait p95 > 60s; starve; matche
 
 ### Tracing
 
-Laravel request id per session mutation. Sentry transactions on `/sessions/*`.
+Request id per session mutation. Sentry transactions on `/sessions/*`.
 
 ### Backups
 
-- MySQL: Hostinger **daily** backups + weekly download of a dump to off-host; **restore drill** before public beta (`docs/runbooks/restore.md`). Plan DB cap is **3 GB**.
-- Session/queue rows are in MySQL (not ephemeral Redis); crash of a PHP worker does **not** forfeit if the row is intact.
-- Photos: Hostinger disk; backup with account backups. No object-store versioning.
+- SQLite: back up the `gamematch.db` file and photo directory; **restore drill** before public beta (`docs/runbooks/restore.md`).
+- Session/queue rows are in SQLite (not ephemeral Redis); a crash does **not** forfeit if the row is intact.
+- Photos: local disk under `DATA_DIR/photos`; back up with the database file. No object-store versioning.
 
 ### Flag rollback
 
@@ -1481,7 +1485,7 @@ Founder/product edits SQL seed or admin later. **No community prompts.** NSFW `n
 
 ### Mod queue authn
 
-`GET/POST /internal/mod/reports` requires a **session whose `users.role` is `mod` or `admin`**. No shared-secret query param. Unauthenticated → 401; `role=user` → 403. Same Sanctum cookie as the app.
+`GET/POST /internal/mod/reports` requires a **session whose `users.role` is `mod` or `admin`**. No shared-secret query param. Unauthenticated → 401; `role=user` → 403. Same session cookie as the app.
 
 ### On-call (beta)
 
@@ -1537,9 +1541,9 @@ AuthZ tests: no DOB leak; no join others’ sessions; no chat without mutual; bl
 
 ### A4. Venue tablet + PWA together — **Reject v1.**
 
-### A5. Fly + Hono + Postgres + Redis + WebSocket — **Rejected by user 2026-08-26.** Previous KD-9. Better timers, worse fit for Hostinger Business.
+### A5. Fly + Hono + Postgres + Redis + WebSocket — **Rejected by user 2026-08-26.** Previous KD-9. Better timers, heavier operationally than a single Go binary + SQLite.
 
-### A5b. Supabase-only — **Reject.** Not the Hostinger PHP/MySQL plan.
+### A5b. Supabase-only — **Reject.** Not the single-binary Go/SQLite plan.
 
 ### A6. Percent-less (chips only) — **Compromise:** chips always; percent only post-game with enough signals; **honest math**.
 
@@ -1560,8 +1564,8 @@ Max-score starves a new metro. **v1: min-wait, best-of-k on each queue poll (KD-
 | --- | --- | --- | --- |
 | R1 | Empty queue | High | Practice vs house; launch events; wait-biased matcher; **do not fake users** |
 | R2 | iOS PWA push / background poll death | High | Honest UX; A2HS copy; **no SMS match fallback in v1**; RN later if retention dies |
-| R16 | Hostinger PHP worker exhaustion (1 Hz poll × concurrent games) | High | Cap poll 1 Hz; 429; 60-worker budget; degrade chat poll to 5s |
-| R17 | 3 GB MySQL cap | Med | Purge terminal sessions > 30d; no raw GPS; WebP photos on disk not DB |
+| R16 | request/CPU exhaustion (1 Hz poll × concurrent games) | High | Cap poll 1 Hz; degrade chat poll to 5s |
+| R17 | database file growth | Med | Purge terminal sessions > 30d; no raw GPS; photos on disk, not in the DB |
 | R3 | Fake 94% | High | Honest percent; worked example; no clamp; hide until n≥8 answers |
 | R4 | Stalking | High | No deck, no exact geo, KD-28, coarse last-active |
 | R5 | Dating vs friendship identity | Med | **OQ-1 resolved:** dating-with-games; `intentsOk` splits dating vs non-dating pools |
@@ -1587,7 +1591,7 @@ Max-score starves a new metro. **v1: min-wait, best-of-k on each queue poll (KD-
 | **OQ-1** | **Dating-with-games.** Primary job is dating. Friendship/Gaming are secondary. **KD-12 / `intentsOk`:** if either has `dating`, both must have `dating`. No Dating↔Friendship-only or Dating↔Gaming-only. Socializing is not a dating bridge. Non-dating users pair among Friendship / Gaming / Socializing. |
 | **OQ-4** | **18+** in the PWA (KD-10). Venue 21+ is door policy. Counsel before public. |
 | **OQ-28** | **Kill in-product “WHO’S SINGLE?”** (KD-4). Event marketing “Singles Night” may exist outside guest UI; no guest flags; no TV “who’s single.” |
-| **OQ-12 / OQ-13** | **React PWA + PHP 8.3 Laravel + MySQL 8 on Hostinger Business.** No Fly, Hono, Postgres, Redis, or WebSocket. Poll + cron. |
+| **OQ-12 / OQ-13** | **React PWA + Go + SQLite** (originally PHP 8.3 Laravel + MySQL; backend ported 2026-10-06). No Fly, Hono, Postgres, Redis, or WebSocket. Poll + in-process ticker. |
 
 ### Confirm-the-KD — still in force (user did not override)
 
@@ -1613,7 +1617,7 @@ Max-score starves a new metro. **v1: min-wait, best-of-k on each queue poll (KD-
 **OQ-19.** Rooms v1? **No.**  
 **OQ-20.** Who writes prompts? Default founder; NSFW off.  
 **OQ-21.** Neon vs AA — **AA wins** if conflict.  
-**OQ-22.** Hosting region? Default **Hostinger US datacenter** (whichever the Business plan is on).  
+**OQ-22.** Hosting region? Default **US** (the region closest to users).  
 **OQ-23.** Mod staff day 1? Default none → pick-list + freeze path.  
 **OQ-24.** No branded Connect Four in v1.  
 **OQ-27.** Practice vs house? **Yes, KD-26.**
@@ -1638,7 +1642,9 @@ Issue #1 themes (concept, nav, onboarding, games, reveal, chat, rooms, venue, ta
 
 ## PR Plan
 
-Each PR independently reviewable. **No unused v2 tables. No production debug pair-by-id.** Stack is KD-9 (Hostinger PHP/MySQL).
+> **Note (2026-10-06):** this PR-by-PR breakdown is the original build order. The backend was since rewritten in Go on SQLite, so rows that say "Laravel", "PHP", "MySQL", "Sanctum", "Composer", or "Hostinger cron" describe the historical implementation, not the current tree. See the Tech stack recommendation table for the current stack.
+
+Each PR independently reviewable. **No unused v2 tables. No production debug pair-by-id.** Stack is KD-9 (Go + SQLite).
 
 **Dogfood milestone:** after **PR 20** (closed loop) **and** PR 5 (flags), PR 8 (safety+rate limits), PR 9 (delete).  
 **Closed beta:** after PR 24 (obs + backups) with `auth.public_signup=false`.
