@@ -26,9 +26,10 @@ func NewEngine(s *store.Store, cfg config.Config) *Engine {
 
 // Sentinel errors mapped to HTTP codes by the API layer.
 var (
-	ErrForbidden = errors.New("forbidden")
-	ErrClosed    = errors.New("closed")
-	ErrNotFound  = errors.New("not found")
+	ErrForbidden   = errors.New("forbidden")
+	ErrClosed      = errors.New("closed")
+	ErrNotFound    = errors.New("not found")
+	ErrNotYourTurn = errors.New("not your turn")
 )
 
 const (
@@ -40,7 +41,42 @@ const (
 	revealWindow  = 4 * time.Second
 	countdown     = 3 * time.Second
 	rematchWindow = 30 * time.Second
+	// Guess My Answer: the guesser gets a second, longer window.
+	guessWindow = 12 * time.Second
 )
+
+// gmaRoles is the per-round role assignment for Guess My Answer.
+type gmaRoles struct {
+	Answerer string `json:"answerer"`
+	Guesser  string `json:"guesser"`
+	Phase    string `json:"phase"`
+}
+
+// gmaFor decodes a round's Guess My Answer roles. It reports false for other
+// game kinds.
+func gmaFor(round store.Round) (gmaRoles, bool) {
+	if round.Extra == nil {
+		return gmaRoles{}, false
+	}
+	var roles gmaRoles
+	if err := json.Unmarshal([]byte(*round.Extra), &roles); err != nil || roles.Answerer == "" || roles.Guesser == "" {
+		return gmaRoles{}, false
+	}
+	if roles.Phase == "" {
+		roles.Phase = "answer"
+	}
+	return roles, true
+}
+
+// revealRound closes a round and opens the reveal window.
+func (e *Engine) revealRound(ctx context.Context, ses store.GameSession, round *store.Round, now time.Time) error {
+	if err := e.Store.PutRoundState(ctx, round.ID, "reveal"); err != nil {
+		return err
+	}
+	ses.State = "reveal_round"
+	ses.AnswerBy = ptr(store.FmtTS(now.Add(revealWindow)))
+	return e.Store.UpdateSession(ctx, ses)
+}
 
 // StartSession creates a session with its participants.
 func (e *Engine) StartSession(ctx context.Context, kind, mode string, userIDs []string) (store.GameSession, error) {
@@ -136,6 +172,19 @@ func (e *Engine) Answer(ctx context.Context, sessionID, userID string, payload j
 	if round == nil {
 		return ErrNotFound
 	}
+	// Guess My Answer: only the role that owns the current phase may submit.
+	if roles, ok := gmaFor(*round); ok {
+		switch roles.Phase {
+		case "answer":
+			if userID != roles.Answerer {
+				return ErrNotYourTurn
+			}
+		case "guess":
+			if userID != roles.Guesser {
+				return ErrNotYourTurn
+			}
+		}
+	}
 	body := string(payload)
 	if body == "" {
 		body = "null"
@@ -221,15 +270,37 @@ func (e *Engine) advanceLocked(ctx context.Context, sessionID string) error {
 			return err
 		}
 		timedOut := round.AnswerBy != nil && !store.ParseTS(*round.AnswerBy).After(now)
+
+		// Guess My Answer runs in two phases: the answerer commits first, then
+		// the guesser has a second (longer) window.
+		if roles, ok := gmaFor(*round); ok {
+			switch roles.Phase {
+			case "answer":
+				if answerFor(answers, roles.Answerer) != nil {
+					roles.Phase = "guess"
+					deadline := store.FmtTS(now.Add(guessWindow))
+					extra, _ := json.Marshal(roles)
+					if err := e.Store.PutRoundExtra(ctx, round.ID, string(extra), deadline); err != nil {
+						return err
+					}
+					ses.AnswerBy = &deadline
+					return e.Store.UpdateSession(ctx, ses)
+				}
+				if timedOut {
+					// Nobody answered: skip the round without recording signals.
+					return e.revealRound(ctx, ses, round, now)
+				}
+				return nil
+			case "guess":
+				if len(answers) >= 2 || timedOut {
+					return e.revealRound(ctx, ses, round, now)
+				}
+				return nil
+			}
+		}
+
 		if len(answers) >= 2 || timedOut {
-			if err := e.Store.PutRoundState(ctx, round.ID, "reveal"); err != nil {
-				return err
-			}
-			ses.State = "reveal_round"
-			ses.AnswerBy = ptr(store.FmtTS(now.Add(revealWindow)))
-			if err := e.Store.UpdateSession(ctx, ses); err != nil {
-				return err
-			}
+			return e.revealRound(ctx, ses, round, now)
 		}
 	}
 
@@ -276,7 +347,7 @@ func (e *Engine) openRound(ctx context.Context, ses store.GameSession, index int
 					break
 				}
 			}
-			b, _ := json.Marshal(map[string]string{"answerer": answerer.UserID, "guesser": guesser.UserID})
+			b, _ := json.Marshal(gmaRoles{Answerer: answerer.UserID, Guesser: guesser.UserID, Phase: "answer"})
 			extra = ptr(string(b))
 		}
 	}
@@ -286,8 +357,12 @@ func (e *Engine) openRound(ctx context.Context, ses store.GameSession, index int
 		return err
 	}
 	if round == nil {
-		secs := 12
-		if ses.Kind == "this_or_that" {
+		secs := 20 // twenty_questions
+		switch ses.Kind {
+		case "this_or_that":
+			secs = 8
+		case "guess_my_answer":
+			// The answer phase is short; the guess phase gets guessWindow.
 			secs = 8
 		}
 		answerBy := store.FmtTS(time.Now().UTC().Add(time.Duration(secs) * time.Second))
@@ -305,6 +380,23 @@ func (e *Engine) openRound(ctx context.Context, ses store.GameSession, index int
 		}
 		if err := e.Store.InsertRound(ctx, round); err != nil {
 			return err
+		}
+		// Practice: when the House holds the answer role, answer immediately so
+		// the human is not stuck waiting on a bot that will not act.
+		if ses.Kind == "guess_my_answer" && ses.Mode == modePractice {
+			if roles, ok := gmaFor(*round); ok && roles.Answerer == e.Cfg.HouseUserID {
+				payload := e.houseAnswer(ctx, ses.Kind, round.PromptID)
+				if err := e.Store.UpsertRoundAnswer(ctx, &store.RoundAnswer{RoundID: round.ID, UserID: roles.Answerer, Payload: payload}); err != nil {
+					return err
+				}
+				roles.Phase = "guess"
+				deadline := store.FmtTS(time.Now().UTC().Add(guessWindow))
+				encoded, _ := json.Marshal(roles)
+				if err := e.Store.PutRoundExtra(ctx, round.ID, string(encoded), deadline); err != nil {
+					return err
+				}
+				round.AnswerBy = &deadline
+			}
 		}
 	}
 

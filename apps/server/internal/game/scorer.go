@@ -126,14 +126,30 @@ func (e *Engine) ScoreSession(ctx context.Context, sessionID string) (*Score, er
 	}
 
 	for _, pr := range perRound {
+		roles, isGMA := gmaFor(pr.round)
 		for _, uid := range []string{a, b} {
 			for _, ans := range pr.answers {
 				if ans.UserID != uid {
 					continue
 				}
 				sid := sessionID
-				val := ans.Payload
-				if err := e.Store.InsertSignalEvent(ctx, uid, &sid, "choice", "round."+itoa(pr.round.RoundIndex), &val); err != nil {
+				value := ans.Payload
+				kind := "choice"
+				if isGMA {
+					switch uid {
+					case roles.Answerer:
+						kind = "gma_answer"
+					case roles.Guesser:
+						kind = "gma_guess"
+						correct := false
+						if secret := answerFor(pr.answers, roles.Answerer); secret != nil {
+							correct = guessIsCorrect(secret.Payload, ans.Payload)
+						}
+						encoded, _ := json.Marshal(map[string]bool{"correct": correct})
+						value = string(encoded)
+					}
+				}
+				if err := e.Store.InsertSignalEvent(ctx, uid, &sid, kind, "round."+itoa(pr.round.RoundIndex), &value); err != nil {
 					return nil, err
 				}
 			}
@@ -170,6 +186,17 @@ func (e *Engine) ScoreSession(ctx context.Context, sessionID string) (*Score, er
 	}
 
 	return &Score{Score: score, Percent: percent, Reasons: reasons, Components: components}, nil
+}
+
+// guessIsCorrect reports whether a Guess My Answer guess matched the secret.
+func guessIsCorrect(secret, guess string) bool {
+	var s, g struct {
+		OptionID string `json:"optionId"`
+	}
+	if json.Unmarshal([]byte(secret), &s) != nil || json.Unmarshal([]byte(guess), &g) != nil {
+		return false
+	}
+	return s.OptionID != "" && s.OptionID == g.OptionID
 }
 
 func jaccard(a, b []string) float64 {
