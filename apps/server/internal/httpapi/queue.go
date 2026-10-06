@@ -9,6 +9,9 @@ func (s *Server) queueJoin(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, http.StatusConflict, "incognito", "Turn off incognito to enter the lobby")
 		return
 	}
+	if !s.allow(w, r, "queue:"+u.ID, limitQueuePerUser, windowQueue) {
+		return
+	}
 	var body struct {
 		GameKind      string `json:"gameKind"`
 		AllowPractice bool   `json:"allowPractice"`

@@ -14,6 +14,9 @@ func (s *Server) inviteCreate(w http.ResponseWriter, r *http.Request) {
 		GameKind     string `json:"gameKind"`
 	}
 	_ = decodeJSON(r, &body)
+	if !s.allow(w, r, "invites:"+currentUser(r).ID, limitInvitesPerUser, windowInvites) {
+		return
+	}
 	kind := body.GameKind
 	if kind == "" {
 		kind = "this_or_that"

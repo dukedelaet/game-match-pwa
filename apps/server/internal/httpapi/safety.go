@@ -90,6 +90,13 @@ func (s *Server) report(w http.ResponseWriter, r *http.Request) {
 	if body.Reason == "" {
 		body.Reason = "other"
 	}
+	// Reports of csam/underage are never dropped (§Reports); everything else is
+	// limited to 10/day per reporter.
+	if body.Reason != "csam" && body.Reason != "underage" {
+		if !s.allow(w, r, "reports:"+u.ID, limitReportsPerUser, windowReports) {
+			return
+		}
+	}
 	var subject *string
 	if body.UserID != "" {
 		subject = &body.UserID

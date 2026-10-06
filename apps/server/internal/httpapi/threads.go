@@ -152,6 +152,9 @@ func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
 		return
 	}
+	if !s.allow(w, r, "messages:"+thread.ID, limitMessagesPerThread, windowMessages) {
+		return
+	}
 	sender := u.ID
 	msg := &store.Message{ThreadID: thread.ID, SenderID: &sender, Kind: "text", Body: text}
 	if err := s.Store.InsertMessage(ctx, msg); err != nil {

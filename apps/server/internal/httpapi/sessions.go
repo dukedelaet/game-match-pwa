@@ -33,6 +33,9 @@ func (s *Server) sessionJoin(w http.ResponseWriter, r *http.Request) {
 func (s *Server) sessionShow(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	u := currentUser(r)
+	if !s.allow(w, r, "poll:"+u.ID, limitSessionPollPerUser, windowSessionPoll) {
+		return
+	}
 	id := idParam(r)
 	if err := s.Engine.Heartbeat(ctx, id, u.ID); err != nil {
 		notFound(w)

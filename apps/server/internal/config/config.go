@@ -15,6 +15,25 @@ type Config struct {
 	Debug       bool
 	HouseUserID string
 	DevOTP      string
+
+	// Optional integrations. Empty means "not configured": the code path
+	// degrades to a logged no-op instead of failing.
+	SMSProvider     string // "log" (default) or "twilio"
+	TwilioAccountID string
+	TwilioAuthToken string
+	TwilioFrom      string
+
+	TurnstileSecret string
+
+	GoogleClientID  string
+	AppleClientID   string
+	AppleTeamID     string
+	AppleKeyID      string
+	ApplePrivateKey string
+
+	VAPIDPublicKey  string
+	VAPIDPrivateKey string
+	VAPIDSubject    string
 }
 
 func getenv(key, def string) string {
@@ -57,12 +76,25 @@ func Load() Config {
 		debug = v
 	}
 	return Config{
-		Addr:        addr,
-		DataDir:     dataDir,
-		Env:         getenv("APP_ENV", "local"),
-		Debug:       debug,
-		HouseUserID: getenv("HOUSE_USER_ID", "00000000-0000-4000-8000-000000000001"),
-		DevOTP:      getenv("DEV_OTP", "123456"),
+		Addr:            addr,
+		DataDir:         dataDir,
+		Env:             getenv("APP_ENV", "local"),
+		Debug:           debug,
+		HouseUserID:     getenv("HOUSE_USER_ID", "00000000-0000-4000-8000-000000000001"),
+		DevOTP:          getenv("DEV_OTP", "123456"),
+		SMSProvider:     getenv("SMS_PROVIDER", "log"),
+		TwilioAccountID: getenv("TWILIO_ACCOUNT_SID", ""),
+		TwilioAuthToken: getenv("TWILIO_AUTH_TOKEN", ""),
+		TwilioFrom:      getenv("TWILIO_FROM", ""),
+		TurnstileSecret: getenv("TURNSTILE_SECRET", ""),
+		GoogleClientID:  getenv("GOOGLE_CLIENT_ID", ""),
+		AppleClientID:   getenv("APPLE_CLIENT_ID", ""),
+		AppleTeamID:     getenv("APPLE_TEAM_ID", ""),
+		AppleKeyID:      getenv("APPLE_KEY_ID", ""),
+		ApplePrivateKey: getenv("APPLE_PRIVATE_KEY", ""),
+		VAPIDPublicKey:  getenv("VAPID_PUBLIC_KEY", ""),
+		VAPIDPrivateKey: getenv("VAPID_PRIVATE_KEY", ""),
+		VAPIDSubject:    getenv("VAPID_SUBJECT", "mailto:ops@example.com"),
 	}
 }
 
