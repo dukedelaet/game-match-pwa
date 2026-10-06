@@ -419,6 +419,7 @@ func (e *Engine) RunTicker(ctx context.Context, interval time.Duration) {
 			return
 		case <-ticker.C:
 			_ = e.Store.ExpireStaleInvites(ctx)
+			_ = e.Store.ExpireStaleMatches(ctx)
 			ids, err := e.Store.ActiveSessionIDs(ctx)
 			if err != nil {
 				continue

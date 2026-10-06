@@ -66,6 +66,13 @@ func (s *Store) SetUserStatus(ctx context.Context, userID, status string) error 
 	return err
 }
 
+// BlocksBy lists the blocks a user has placed (directed, newest first).
+func (s *Store) BlocksBy(ctx context.Context, blockerID string) ([]Block, error) {
+	out := []Block{}
+	err := s.DB.SelectContext(ctx, &out, `SELECT * FROM blocks WHERE blocker_id = ? ORDER BY created_at DESC`, blockerID)
+	return out, err
+}
+
 // HasActiveLegalHold reports whether a user is under an active legal hold.
 func (s *Store) HasActiveLegalHold(ctx context.Context, userID string) (bool, error) {
 	var n int

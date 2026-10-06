@@ -23,6 +23,11 @@ func (s *Server) block(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
 		return
 	}
+	// Blocking cancels any pending invites in both directions (§Block).
+	if err := s.Store.CancelPendingInvites(ctx, u.ID, body.UserID); err != nil {
+		WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
+		return
+	}
 	a, b := game.OrderedPair(u.ID, body.UserID)
 	if pair, _ := s.Store.PairFor(ctx, a, b); pair != nil {
 		pair.State = "blocked"

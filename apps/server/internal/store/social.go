@@ -119,6 +119,41 @@ func (s *Store) PutMatchState(ctx context.Context, id, state string, unmatchedBy
 	return err
 }
 
+// ExpireStaleMatches moves matches past expires_at to expired, along with their
+// pair (cooldown cleared, so they may re-queue) and thread (locked).
+func (s *Store) ExpireStaleMatches(ctx context.Context) error {
+	now := NowTS()
+	var stale []Match
+	if err := s.DB.SelectContext(ctx, &stale, `
+		SELECT * FROM matches WHERE state = 'mutual' AND expires_at IS NOT NULL AND expires_at <= ?`, now); err != nil {
+		return err
+	}
+	for _, m := range stale {
+		if err := s.PutMatchState(ctx, m.ID, "expired", nil); err != nil {
+			return err
+		}
+		if _, err := s.DB.ExecContext(ctx, `
+			UPDATE pair_relationships SET state='expired', cooldown_until=NULL, updated_at=?
+			WHERE user_a=? AND user_b=? AND state='mutual'`, now, m.UserA, m.UserB); err != nil {
+			return err
+		}
+		if err := s.PutThreadStateByMatch(ctx, m.ID, "locked"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// CancelPendingInvites cancels pending invites between two users in either
+// direction, as required when one of them blocks the other.
+func (s *Store) CancelPendingInvites(ctx context.Context, a, b string) error {
+	_, err := s.DB.ExecContext(ctx, `
+		UPDATE invites SET state='cancelled', updated_at=?
+		WHERE state='pending' AND ((from_user_id=? AND to_user_id=?) OR (from_user_id=? AND to_user_id=?))`,
+		NowTS(), a, b, b, a)
+	return err
+}
+
 // --- threads & messages ---
 
 // ThreadForMatch loads the thread for a match, or nil.

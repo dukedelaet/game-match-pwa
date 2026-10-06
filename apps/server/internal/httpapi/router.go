@@ -34,6 +34,8 @@ func (s *Server) Router() http.Handler {
 			r.Delete("/me", s.deleteMe)
 			r.Post("/me/photos", s.uploadPhoto)
 			r.Get("/me/xp", s.meXp)
+			r.Get("/me/blocks", s.meBlocks)
+			r.Get("/me/export", s.meExport)
 			r.Get("/photos/{id}", s.photo)
 
 			r.Get("/home", s.home)
@@ -47,6 +49,8 @@ func (s *Server) Router() http.Handler {
 			r.Post("/sessions/{id}/answer", s.sessionAnswer)
 			r.Post("/sessions/{id}/leave", s.sessionLeave)
 			r.Post("/sessions/{id}/rematch", s.rematch)
+
+			r.Get("/matches", s.matches)
 
 			r.Get("/pairs", s.pairs)
 			r.Get("/pairs/{id}", s.pairShow)
