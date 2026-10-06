@@ -9,3 +9,4 @@ node_modules
 *.log
 .idea
 .vscode
+/apps/server/bin/
