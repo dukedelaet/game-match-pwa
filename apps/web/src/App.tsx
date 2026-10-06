@@ -10,6 +10,7 @@ import {
   redirect,
 } from '@tanstack/react-router'
 import { api, type Me } from './api'
+import { useInstallPrompt } from './useInstallPrompt'
 
 let meCache: Me | null = null
 
@@ -647,6 +648,7 @@ function ChatThread({ id }: { id: string }) {
 
 function MePage() {
   const nav = useNavigate()
+  const { installed } = useInstallPrompt()
   const [u, setU] = useState<Me | null>(null)
   const [legal, setLegal] = useState<any>(null)
   const [xp, setXp] = useState<any>(null)
@@ -681,6 +683,11 @@ function MePage() {
           />
           Incognito (hide from lobby)
         </label>
+        {!installed && (
+          <Link to="/install" className="block rounded-2xl bg-white/5 p-4 text-sm text-white/70">
+            Install app
+          </Link>
+        )}
         <Link to="/legal" className="block rounded-2xl bg-white/5 p-4 text-sm text-white/70">
           Terms & privacy
         </Link>
@@ -698,6 +705,55 @@ function MePage() {
         </button>
       </div>
     </Tabs>
+  )
+}
+
+function InstallPage() {
+  const { canInstall, installed, platform, install } = useInstallPrompt()
+  const [status, setStatus] = useState<'idle' | 'accepted' | 'dismissed'>('idle')
+
+  const doInstall = async () => {
+    const outcome = await install()
+    if (outcome === 'accepted' || outcome === 'dismissed') setStatus(outcome)
+  }
+
+  return (
+    <div className="px-5 py-10 space-y-4">
+      <Link to="/me" className="text-sm text-fuchsia-300">
+        ← Me
+      </Link>
+      <h1 className="text-2xl font-black">Install GameMatch</h1>
+      <p className="text-white/70">Add GameMatch to your home screen for a full-screen, app-like experience.</p>
+      {installed || status === 'accepted' ? (
+        <div className="rounded-2xl bg-fuchsia-500/20 p-4" role="status">
+          <p className="font-bold">You&apos;re all set</p>
+          <p className="mt-1 text-sm text-white/70">GameMatch is installed. Open it from your home screen.</p>
+        </div>
+      ) : canInstall ? (
+        <div className="space-y-3">
+          <button className="w-full rounded-2xl bg-fuchsia-500 py-3 font-bold text-white shadow-[0_0_24px_#d946ef]" onClick={doInstall}>
+            Install GameMatch
+          </button>
+          {status === 'dismissed' && <p className="text-sm text-white/60">No problem. You can add it later from your browser menu.</p>}
+        </div>
+      ) : platform === 'ios' ? (
+        <div className="space-y-3 rounded-2xl bg-white/10 p-4">
+          <p className="font-bold">Add to Home Screen</p>
+          <ol className="list-decimal space-y-2 pl-5 text-sm text-white/70">
+            <li>Tap the Share button in Safari.</li>
+            <li>Scroll down and choose “Add to Home Screen”.</li>
+            <li>Tap Add, then GameMatch opens full screen.</li>
+          </ol>
+          <p className="text-xs text-white/50">Use Safari for this. Other iOS browsers can&apos;t install apps.</p>
+        </div>
+      ) : (
+        <div className="rounded-2xl bg-white/10 p-4 text-sm text-white/70">
+          <p className="font-bold text-white">Install from your browser menu</p>
+          <p className="mt-2">Open the browser menu and choose “Install app” or “Add to Home Screen”.</p>
+        </div>
+      )}
+      <p className="text-xs text-white/50">Installing keeps you signed in and enables game notifications.</p>
+    </div>
   )
 }
 
@@ -806,6 +862,7 @@ const threadRoute = createRoute({
   },
 })
 const meRoute = createRoute({ getParentRoute: () => rootRoute, path: '/me', beforeLoad: requireUser, component: MePage })
+const installRoute = createRoute({ getParentRoute: () => rootRoute, path: '/install', beforeLoad: requireUser, component: InstallPage })
 const legalRoute = createRoute({ getParentRoute: () => rootRoute, path: '/legal', component: LegalPage })
 const staffRoute = createRoute({ getParentRoute: () => rootRoute, path: '/staff', beforeLoad: requireUser, component: StaffPage })
 const offlineRoute = createRoute({ getParentRoute: () => rootRoute, path: '/offline', component: OfflinePage })
@@ -822,6 +879,7 @@ const routeTree = rootRoute.addChildren([
   chatRoute,
   threadRoute,
   meRoute,
+  installRoute,
   legalRoute,
   staffRoute,
   offlineRoute,
