@@ -1,0 +1,30 @@
+[Unit]
+Description=GameMatch API (Go + SQLite)
+Documentation=https://github.com/dukedelaet/game-match-pwa
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Create a dedicated system user first, e.g.:
+#   sudo useradd --system --home /var/lib/gamematch --shell /usr/sbin/nologin gamematch
+User=gamematch
+Group=gamematch
+WorkingDirectory=/opt/gamematch
+EnvironmentFile=/etc/gamematch/gamematch.env
+ExecStart=/opt/gamematch/gamematch
+Restart=always
+RestartSec=3
+
+# The service binds to loopback; Caddy is the only public listener.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/gamematch
+
+[Install]
+WantedBy=multi-user.target

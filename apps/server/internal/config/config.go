@@ -24,8 +24,15 @@ func getenv(key, def string) string {
 	return def
 }
 
-// Load reads configuration from environment variables, applying defaults.
+// Load reads configuration from an optional dotenv file and then the
+// environment (environment wins), applying defaults.
 func Load() Config {
+	if path := getenv("ENV_FILE", ""); path != "" {
+		_ = LoadDotenv(path)
+	} else {
+		_ = LoadDotenv(".env")
+	}
+
 	dataDir := getenv("DATA_DIR", "")
 	if dataDir == "" {
 		// Default to <repo>/apps/server/data, or ./data when cwd is the server dir.

@@ -1,0 +1,44 @@
+# GameMatch — Caddy configuration
+#
+# Set GAMEMATCH_SITE to your domain (e.g. gamematch.example.com) and Caddy will
+# obtain a certificate automatically. Leave it unset to serve plain HTTP on :80
+# for local use, or set it to `localhost` for Caddy's internal TLS.
+#
+# Set GAMEMATCH_ROOT to the built PWA directory if it is not `apps/web/dist`
+# relative to the Caddy working directory.
+
+{
+	admin off
+}
+
+{$GAMEMATCH_SITE:localhost} {
+	encode zstd gzip
+
+	# The API owns everything under /v1.
+	handle /v1/* {
+		reverse_proxy 127.0.0.1:8000
+	}
+
+	# Everything else is the built PWA.
+	handle {
+		root * {$GAMEMATCH_ROOT:apps/web/dist}
+		try_files {path} /index.html
+		file_server
+
+		# Content-hashed assets can be cached hard; the shell must revalidate.
+		@assets path /assets/*
+		header @assets Cache-Control "public, max-age=31536000, immutable"
+		@shell path / /index.html /sw.js /registerSW.js /manifest.webmanifest
+		header @shell Cache-Control "no-cache"
+	}
+
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-X-Powered-By
+	}
+
+	log {
+		output file /var/log/caddy/gamematch-access.log
+	}
+}
