@@ -36,6 +36,7 @@ func (s *Server) Router() http.Handler {
 			r.Get("/me/xp", s.meXp)
 			r.Get("/me/blocks", s.meBlocks)
 			r.Get("/me/export", s.meExport)
+			r.Post("/me/location", s.setLocation)
 			r.Get("/photos/{id}", s.photo)
 
 			r.Get("/home", s.home)

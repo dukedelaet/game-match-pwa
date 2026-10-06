@@ -131,6 +131,20 @@ func (s *Store) UpsertPrivatePhone(ctx context.Context, userID, phone string) er
 	return err
 }
 
+// UpdateUserLocation stores a metro and its coarse geohash. The caller passes
+// only derived values; raw coordinates never reach the database.
+func (s *Store) UpdateUserLocation(ctx context.Context, userID, metroID, cityLabel, geohash, source string) error {
+	now := NowTS()
+	if _, err := s.DB.ExecContext(ctx, `
+		UPDATE users SET metro_id=?, approx_geohash=?, approx_geohash_source=?, updated_at=? WHERE id=?`,
+		metroID, geohash, source, now, userID); err != nil {
+		return err
+	}
+	_, err := s.DB.ExecContext(ctx, `UPDATE profiles SET city_label=?, updated_at=? WHERE user_id=?`,
+		cityLabel, now, userID)
+	return err
+}
+
 // ProfileFor loads a profile, or nil when absent.
 func (s *Store) ProfileFor(ctx context.Context, userID string) (*Profile, error) {
 	var p Profile

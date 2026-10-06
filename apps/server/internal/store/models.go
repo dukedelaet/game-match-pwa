@@ -18,6 +18,7 @@ type User struct {
 	LastActiveOn   *string `db:"last_active_on"`
 	MetroID        *string `db:"metro_id"`
 	ApproxGeohash  *string `db:"approx_geohash"`
+	GeohashSource  *string `db:"approx_geohash_source"`
 	XP             int     `db:"xp"`
 	Level          int     `db:"level"`
 	CreatedAt      *string `db:"created_at"`
