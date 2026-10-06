@@ -4,6 +4,8 @@
   "scripts": {
     "dev": "pnpm --filter web dev",
     "build": "pnpm --filter web build",
-    "api": "php apps/api/artisan serve --host=127.0.0.1 --port=8000"
+    "api": "cd apps/server && APP_DEBUG=true go run ./cmd/gamematch",
+    "api:seed": "cd apps/server && APP_DEBUG=true go run ./cmd/gamematch seed",
+    "api:test": "cd apps/server && go test ./..."
   }
 }
