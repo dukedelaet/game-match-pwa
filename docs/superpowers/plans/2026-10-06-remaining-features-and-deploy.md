@@ -1,6 +1,12 @@
 # Remaining Features + Caddy Deploy — Implementation Plan
 
-> **Status:** in progress (2026-10-06). Executed on branch `feat/remaining-features-and-deploy`.
+> **Status:** DONE (2026-10-06). All eight phases are implemented on
+> `feat/remaining-features-and-deploy`, each with its own commit and tests.
+> Phases 1-5 and 7 are complete as specified. Phase 8 (Web Push) ships the
+> backend, the subscription API, and the browser opt-in; delivery stays inert
+> until VAPID keys are configured. The third-party integrations (Twilio, Google
+> and Apple OAuth, Cloudflare Turnstile, Web Push) are all config-gated and
+> verified with fakes, so no secrets are required to run or test the app.
 
 **Goal:** Close every gap between the prototype `apps/server` (Go + SQLite) and the
 normative v1 spec in `docs/design-docs-and-wireframes.md`, and make the app
