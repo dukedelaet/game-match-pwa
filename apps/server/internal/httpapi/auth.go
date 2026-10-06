@@ -14,6 +14,7 @@ import (
 
 	"gamematch/internal/config"
 	"gamematch/internal/game"
+	"gamematch/internal/push"
 	"gamematch/internal/ratelimit"
 	"gamematch/internal/sms"
 	"gamematch/internal/store"
@@ -36,6 +37,7 @@ type Server struct {
 	Limiter   *ratelimit.Limiter
 	SMS       sms.Provider
 	Turnstile turnstile.Verifier
+	Push      *push.Sender
 
 	// DisableRateLimits bypasses throttling. Tests set it so poll-heavy flows
 	// do not have to sleep; the limiter has its own tests.
@@ -53,6 +55,7 @@ func NewServer(st *store.Store, engine *game.Engine, matcher *game.Matcher, cfg 
 		Limiter:   ratelimit.New(st.DB),
 		SMS:       sms.New(cfg),
 		Turnstile: turnstile.New(cfg.TurnstileSecret),
+		Push:      push.New(cfg),
 	}
 }
 

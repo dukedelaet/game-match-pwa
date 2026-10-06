@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"gamematch/internal/game"
+	"gamematch/internal/push"
 	"gamematch/internal/store"
 )
 
@@ -70,6 +71,12 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request, targetID, 
 		WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
 		return
 	}
+	s.notifyPush(ctx, targetID, push.Message{
+		Title: "Someone wants to play",
+		Body:  "You have two minutes to accept.",
+		URL:   "/home",
+		Tag:   "invite",
+	})
 	WriteJSON(w, http.StatusOK, item)
 }
 

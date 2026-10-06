@@ -10,6 +10,7 @@ import {
   redirect,
 } from '@tanstack/react-router'
 import { api, type Me } from './api'
+import { enablePush, pushResultMessage } from './push'
 import { useInstallPrompt } from './useInstallPrompt'
 
 async function requireUser() {
@@ -645,6 +646,7 @@ function MePage() {
   const [u, setU] = useState<Me | null>(null)
   const [legal, setLegal] = useState<any>(null)
   const [xp, setXp] = useState<any>(null)
+  const [pushNote, setPushNote] = useState('')
   useEffect(() => {
     api.get('/v1/me').then((r) => setU(r.user))
     api.get('/v1/legal').then(setLegal)
@@ -684,6 +686,13 @@ function MePage() {
         <Link to="/legal" className="block rounded-2xl bg-white/5 p-4 text-sm text-white/70">
           Terms & privacy
         </Link>
+        <button
+          className="w-full rounded-2xl bg-white/10 py-3"
+          onClick={async () => setPushNote(pushResultMessage(await enablePush()))}
+        >
+          Enable notifications
+        </button>
+        {pushNote && <p className="text-sm text-white/60">{pushNote}</p>}
         {u?.role === 'admin' && (
           <Link to="/staff" className="block rounded-2xl bg-fuchsia-500/20 p-4 text-sm">
             Staff tools

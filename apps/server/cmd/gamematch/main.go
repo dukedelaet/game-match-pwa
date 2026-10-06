@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"gamematch/internal/db"
 	"gamematch/internal/game"
 	"gamematch/internal/httpapi"
+	"gamematch/internal/push"
 	"gamematch/internal/seed"
 	"gamematch/internal/store"
 )
@@ -35,6 +37,15 @@ func main() {
 			log.Fatalf("seed: %v", err)
 		}
 		log.Printf("seeded %s", cfg.DBPath())
+		return
+	}
+
+	if len(os.Args) > 1 && os.Args[1] == "vapid" {
+		privateKey, publicKey, err := push.GenerateKeys()
+		if err != nil {
+			log.Fatalf("vapid: %v", err)
+		}
+		fmt.Printf("VAPID_PUBLIC_KEY=%s\nVAPID_PRIVATE_KEY=%s\n", publicKey, privateKey)
 		return
 	}
 

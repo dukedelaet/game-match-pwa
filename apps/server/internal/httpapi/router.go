@@ -37,6 +37,9 @@ func (s *Server) Router() http.Handler {
 			r.Get("/me/blocks", s.meBlocks)
 			r.Get("/me/export", s.meExport)
 			r.Post("/me/location", s.setLocation)
+			r.Get("/push/vapid-public-key", s.vapidPublicKey)
+			r.Post("/me/push", s.subscribePush)
+			r.Delete("/me/push", s.unsubscribePush)
 			r.Get("/photos/{id}", s.photo)
 
 			r.Get("/home", s.home)
