@@ -15,4 +15,6 @@ SERVER_PID=$!
 trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
 
 cd "$ROOT/apps/web"
-exec pnpm dev --host 127.0.0.1 --port 5173
+# Bind every interface by default so phones and other tailnet devices can reach
+# the dev server. Set HOST=127.0.0.1 to keep it local-only.
+exec pnpm dev --host "${HOST:-0.0.0.0}" --port "${PORT:-5173}"
