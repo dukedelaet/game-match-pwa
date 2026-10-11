@@ -296,6 +296,10 @@ function Home() {
 
 function Play() {
   const nav = useNavigate()
+  const [games, setGames] = useState<any[]>([])
+  useEffect(() => {
+    api.get('/v1/games').then((r) => setGames(r.items || []))
+  }, [])
   const start = async (kind: string) => {
     await api.post('/v1/queue', { gameKind: kind })
     nav({ to: '/queue' })
@@ -304,13 +308,10 @@ function Play() {
     <Tabs>
       <div className="px-5 pt-8 space-y-3">
         <h1 className="text-2xl font-black">Play</h1>
-        {[
-          ['this_or_that', 'This or That'],
-          ['twenty_questions', '20 Questions'],
-          ['guess_my_answer', 'Guess My Answer'],
-        ].map(([k, l]) => (
-          <button key={k} className="w-full rounded-2xl bg-white/10 p-5 text-left text-lg font-bold" onClick={() => start(k)}>
-            {l}
+        {games.map((g) => (
+          <button key={g.kind} className="w-full rounded-2xl bg-white/10 p-5 text-left text-lg font-bold" onClick={() => start(g.kind)}>
+            {g.label}
+            <span className="ml-2 text-xs font-normal text-white/40">{g.timerSec}s · {g.rounds} rounds</span>
           </button>
         ))}
       </div>
@@ -360,6 +361,136 @@ function Queue() {
       </button>
     </div>
   )
+}
+
+// RoundAnswers renders the answer input for every round protocol. The prompt
+// payload from /v1/sessions/:id selects the renderer.
+function RoundAnswers({ s, choose }: { s: any; choose: (payload: any) => void }) {
+  const p = s.round?.prompt
+  const [order, setOrder] = useState<string[]>([])
+  const [path, setPath] = useState<string[]>([])
+
+  // Spectrum: five stops on a line.
+  if (p?.stops) {
+    return (
+      <div className="mt-8 space-y-3">
+        <h2 className="text-center text-xl font-black">{p.axis}</h2>
+        {p.stops.map((st: any, i: number) => (
+          <button key={st.id} className="w-full rounded-2xl bg-white/10 py-4" onClick={() => choose({ stop: i })} disabled={s.round.youSubmitted}>
+            {st.label}
+          </button>
+        ))}
+      </div>
+    )
+  }
+
+  // Ranking: tap three in order.
+  if (p?.items) {
+    const pick = (id: string) =>
+      setOrder((cur) => (cur.includes(id) ? cur.filter((x) => x !== id) : cur.length >= 3 ? cur : [...cur, id]))
+    const missing = (p.items as any[]).filter((x: any) => !order.includes(x.id))
+    return (
+      <div className="mt-8 space-y-3">
+        <h2 className="text-center text-xl font-black">{p.prompt}</h2>
+        <p className="text-center text-sm text-fuchsia-200">Tap in order — {order.length}/3</p>
+        <div className="flex flex-col gap-2">
+          {order.map((id, i) => {
+            const item = (p.items as any[]).find((x: any) => x.id === id)
+            return (
+              <div key={id} className="rounded-2xl bg-fuchsia-500/40 py-3 text-center font-bold">
+                {i + 1}. {item?.label}
+              </div>
+            )
+          })}
+          {missing.map((it: any) => (
+            <button key={it.id} className="rounded-2xl bg-white/10 py-3" onClick={() => pick(it.id)}>
+              {it.label}
+            </button>
+          ))}
+        </div>
+        {order.length === 3 && (
+          <button className="w-full rounded-2xl bg-fuchsia-500 py-3 font-bold" onClick={() => choose({ order })}>
+            Lock it in
+          </button>
+        )}
+      </div>
+    )
+  }
+
+  // Branch: three linked either/or taps.
+  if (p?.steps) {
+    const step = p.steps[path.length]
+    const pickSide = (side: string) => {
+      const next = [...path, side]
+      setPath(next)
+      if (next.length === p.steps.length) choose({ path: next })
+    }
+    if (!step) return <p className="mt-10 text-center">Get ready…</p>
+    return (
+      <div className="mt-8 space-y-4">
+        <p className="text-center text-sm text-white/50">
+          Step {path.length + 1} of {p.steps.length}
+        </p>
+        <h2 className="text-center text-xl font-black">{p.prompt}</h2>
+        <p className="text-center text-sm text-fuchsia-200">{step.q}</p>
+        <button className="w-full rounded-2xl bg-violet-600 py-6 text-lg font-black" onClick={() => pickSide('left')}>
+          {step.left?.label}
+        </button>
+        <button className="w-full rounded-2xl bg-fuchsia-600 py-6 text-lg font-black" onClick={() => pickSide('right')}>
+          {step.right?.label}
+        </button>
+      </div>
+    )
+  }
+
+  // Rating: one to five.
+  if (p?.scene) {
+    return (
+      <div className="mt-8 space-y-3">
+        <h2 className="text-center text-xl font-black">Rate the night</h2>
+        <p className="text-center text-sm text-fuchsia-200">{p.scene}</p>
+        {p.options.map((o: any, i: number) => (
+          <button key={o.id} className="w-full rounded-2xl bg-white/10 py-4" onClick={() => choose({ rating: i + 1 })} disabled={s.round.youSubmitted}>
+            {i + 1} · {o.label}
+          </button>
+        ))}
+      </div>
+    )
+  }
+
+  // This or That.
+  if (p?.left) {
+    return (
+      <div className="mt-8 space-y-4">
+        <h2 className="text-center text-xl font-black">This or That</h2>
+        <button className="w-full rounded-3xl bg-violet-600 py-8 text-2xl font-black" onClick={() => choose({ choice: 'left' })} disabled={s.round.youSubmitted}>
+          {p.left.label}
+        </button>
+        <p className="text-center text-white/40">vs</p>
+        <button className="w-full rounded-3xl bg-fuchsia-600 py-8 text-2xl font-black" onClick={() => choose({ choice: 'right' })} disabled={s.round.youSubmitted}>
+          {p.right.label}
+        </button>
+      </div>
+    )
+  }
+
+  // Any option list: 20 Questions, Hot Take, Same Page, Speed Round, Odd One
+  // Out, One Free Evening, and the Guess My Answer guess phase.
+  if (p?.options) {
+    return (
+      <div className="mt-8 space-y-3">
+        <h2 className="text-center text-xl font-black">{p.question ?? p.statement ?? p.prompt}</h2>
+        {s.round.yourRole && <p className="text-center text-sm text-fuchsia-200">{s.round.yourRole === 'answerer' ? 'Your answer' : 'Guess theirs'}</p>}
+        {p.options.map((o: any) => (
+          <button key={o.id} className="w-full rounded-2xl bg-white/10 py-4" onClick={() => choose({ optionId: o.id })} disabled={s.round.youSubmitted}>
+            {o.label}
+          </button>
+        ))}
+      </div>
+    )
+  }
+
+  return <p className="mt-10 text-center">Get ready…</p>
 }
 
 function SessionPage({ id }: { id: string }) {
@@ -454,7 +585,6 @@ function SessionPage({ id }: { id: string }) {
     )
   }
 
-  const p = s.round?.prompt
   const choose = async (payload: any) => {
     await api.post(`/v1/sessions/${id}/answer`, { payload })
   }
@@ -470,29 +600,8 @@ function SessionPage({ id }: { id: string }) {
           <p className="mt-2 text-lg">Them: {JSON.stringify(s.reveal.opponent.payload)}</p>
           {s.reveal.same && <p className="mt-6 text-2xl font-black text-fuchsia-400">Same energy</p>}
         </div>
-      ) : p?.left ? (
-        <div className="mt-8 space-y-4">
-          <h2 className="text-center text-xl font-black">This or That</h2>
-          <button className="w-full rounded-3xl bg-violet-600 py-8 text-2xl font-black" onClick={() => choose({ choice: 'left' })} disabled={s.round.youSubmitted}>
-            {p.left.label}
-          </button>
-          <p className="text-center text-white/40">vs</p>
-          <button className="w-full rounded-3xl bg-fuchsia-600 py-8 text-2xl font-black" onClick={() => choose({ choice: 'right' })} disabled={s.round.youSubmitted}>
-            {p.right.label}
-          </button>
-        </div>
-      ) : p?.options ? (
-        <div className="mt-8 space-y-3">
-          <h2 className="text-center text-xl font-black">{p.question}</h2>
-          {s.round.yourRole && <p className="text-center text-sm text-fuchsia-200">{s.round.yourRole === 'answerer' ? 'Your answer' : 'Guess theirs'}</p>}
-          {p.options.map((o: any) => (
-            <button key={o.id} className="w-full rounded-2xl bg-white/10 py-4" onClick={() => choose({ optionId: o.id })} disabled={s.round.youSubmitted}>
-              {o.label}
-            </button>
-          ))}
-        </div>
       ) : (
-        <p className="mt-10 text-center">Get ready…</p>
+        <RoundAnswers key={s.round?.index} s={s} choose={choose} />
       )}
       {s.round?.youSubmitted && !s.reveal && <p className="mt-6 text-center text-white/50">Waiting on them…</p>}
       <button className="mt-auto pt-8 text-sm text-white/40" onClick={async () => { await api.post(`/v1/sessions/${id}/leave`); nav({ to: '/play' }) }}>
