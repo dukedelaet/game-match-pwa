@@ -167,7 +167,7 @@ func (e *Engine) buildView(ctx context.Context, sessionID, userID string) (Sessi
 		}
 
 		if ses.State == "reveal_round" {
-			same := you != nil && them != nil && jsonEqual(you.Payload, them.Payload)
+			same := you != nil && them != nil && revealsSame(For(ses.Kind).Protocol, json.RawMessage(you.Payload), json.RawMessage(them.Payload))
 			if roles, ok := gmaFor(*round); ok {
 				ans := answerFor(answers, roles.Answerer)
 				guess := answerFor(answers, roles.Guesser)
@@ -254,6 +254,52 @@ func (e *Engine) buildView(ctx context.Context, sessionID, userID string) (Sessi
 		Completed:   completed,
 		ServerNow:   now,
 	}, nil
+}
+
+// revealsSame compares two answers for one protocol: distance-based protocols
+// treat answers within one step as the same, ranking compares the first item,
+// and everything else requires equal payloads.
+func revealsSame(protocol Protocol, a, b json.RawMessage) bool {
+	if protocol == ProtocolSpectrum || protocol == ProtocolRate {
+		stop := func(p json.RawMessage) int {
+			if len(p) == 0 || string(p) == "null" {
+				return -1
+			}
+			var value map[string]any
+			if json.Unmarshal(p, &value) != nil {
+				return -1
+			}
+			for _, key := range []string{"stop", "rating"} {
+				if number, ok := value[key].(float64); ok {
+					return int(number)
+				}
+			}
+			return -1
+		}
+		av, bv := stop(a), stop(b)
+		if av < 0 || bv < 0 {
+			return false
+		}
+		distance := av - bv
+		if distance < 0 {
+			distance = -distance
+		}
+		return distance <= 1
+	}
+	if protocol == ProtocolOrder {
+		first := func(p json.RawMessage) string {
+			var ranked struct {
+				Order []string `json:"order"`
+			}
+			if json.Unmarshal(p, &ranked) != nil || len(ranked.Order) == 0 {
+				return ""
+			}
+			return ranked.Order[0]
+		}
+		aFirst, bFirst := first(a), first(b)
+		return aFirst != "" && aFirst == bFirst
+	}
+	return jsonEqual(string(a), string(b))
 }
 
 func answerFor(answers []store.RoundAnswer, userID string) *store.RoundAnswer {

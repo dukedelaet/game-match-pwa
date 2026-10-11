@@ -142,7 +142,10 @@ func TestGetMeGamesAndLegal(t *testing.T) {
 
 	code, games := alex.json(http.MethodGet, "/v1/games", nil)
 	require.Equal(t, http.StatusOK, code)
-	require.Len(t, games["items"].([]any), 3)
+	require.Len(t, games["items"].([]any), 12)
+	first := games["items"].([]any)[0].(map[string]any)
+	require.NotEmpty(t, first["protocol"])
+	require.NotEmpty(t, first["rounds"])
 
 	code, legal := alex.json(http.MethodGet, "/v1/legal", nil)
 	require.Equal(t, http.StatusOK, code)

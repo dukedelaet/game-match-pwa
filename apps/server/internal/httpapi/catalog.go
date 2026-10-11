@@ -1,6 +1,10 @@
 package httpapi
 
-import "net/http"
+import (
+	"net/http"
+
+	"gamematch/internal/game"
+)
 
 func (s *Server) catalogs(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -69,17 +73,29 @@ func (s *Server) catalogs(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) games(w http.ResponseWriter, r *http.Request) {
 	type gameItem struct {
-		Kind  string `json:"kind"`
-		Label string `json:"label"`
-		Ready bool   `json:"ready"`
+		Kind     string `json:"kind"`
+		Label    string `json:"label"`
+		Protocol string `json:"protocol"`
+		Rounds   int    `json:"rounds"`
+		TimerSec int    `json:"timerSec"`
+		Ready    bool   `json:"ready"`
 	}
-	WriteJSON(w, http.StatusOK, map[string]any{
-		"items": []gameItem{
-			{Kind: "this_or_that", Label: "This or That", Ready: true},
-			{Kind: "twenty_questions", Label: "20 Questions", Ready: true},
-			{Kind: "guess_my_answer", Label: "Guess My Answer", Ready: true},
-		},
-	})
+	items := []gameItem{}
+	for _, kind := range game.RegistryOrder {
+		entry := game.For(kind)
+		if entry.Kind == "" {
+			continue
+		}
+		items = append(items, gameItem{
+			Kind:     entry.Kind,
+			Label:    entry.Label,
+			Protocol: string(entry.Protocol),
+			Rounds:   entry.Rounds,
+			TimerSec: int(entry.Timer.Seconds()),
+			Ready:    entry.Ready,
+		})
+	}
+	WriteJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
 func (s *Server) legal(w http.ResponseWriter, r *http.Request) {

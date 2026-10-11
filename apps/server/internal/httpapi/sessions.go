@@ -66,6 +66,10 @@ func (s *Server) sessionAnswer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.Engine.Answer(ctx, id, u.ID, payload); err != nil {
+		if errors.Is(err, game.ErrBadAnswer) {
+			WriteError(w, http.StatusUnprocessableEntity, "bad_answer", "That answer is not complete")
+			return
+		}
 		if errors.Is(err, game.ErrNotYourTurn) {
 			WriteError(w, http.StatusForbidden, "not_your_turn", "It is not your turn")
 			return

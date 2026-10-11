@@ -127,17 +127,9 @@ func (e *Engine) recordBehavior(ctx context.Context, ses store.GameSession) erro
 // roundWindow is how long a round's owner had to answer.
 func roundWindow(kind string, round store.Round) time.Duration {
 	if roles, ok := gmaFor(round); ok && roles.Phase == "guess" {
-		return guessWindow
+		return GuessWindowFor(kind)
 	}
-	switch kind {
-	case "this_or_that":
-		return 8 * time.Second
-	case "twenty_questions":
-		return 20 * time.Second
-	case "guess_my_answer":
-		return 8 * time.Second
-	}
-	return 8 * time.Second
+	return TimerFor(kind)
 }
 
 // fastSubmit reports whether an answer landed in the first half of its window.
@@ -178,59 +170,117 @@ func (e *Engine) pickedTags(ctx context.Context, userID string) ([]string, error
 		JOIN rounds r ON r.id = ra.round_id
 		JOIN game_sessions gs ON gs.id = r.session_id
 		JOIN prompt_bank p ON p.id = r.prompt_id
-		WHERE ra.user_id = ? AND gs.mode != 'practice'
-		  AND gs.kind IN ('this_or_that','twenty_questions')`, userID)
+		WHERE ra.user_id = ? AND gs.mode != 'practice'`, userID)
 	if err != nil {
 		return nil, err
 	}
 	var tags []string
 	for _, row := range rows {
+		// Guesses are not preferences: a phased game's answers never contribute.
+		if For(row.Kind).Protocol == ProtocolPhased {
+			continue
+		}
 		tags = append(tags, tagsFromPayload(row.Payload, row.Answer)...)
 	}
 	return tags, nil
 }
 
 // tagsFromPayload pulls the selected option's tags straight from prompt JSON.
+// It understands every answer shape: choice/optionId picks, slide stops,
+// ratings, a ranked order (top item only), and a branch path.
 func tagsFromPayload(promptPayload, answer string) []string {
 	var payload struct {
-		Left struct {
-			ID   string   `json:"id"`
-			Tags []string `json:"tags"`
-		} `json:"left"`
-		Right struct {
-			ID   string   `json:"id"`
-			Tags []string `json:"tags"`
-		} `json:"right"`
+		Left    *struct{ Tags []string } `json:"left"`
+		Right   *struct{ Tags []string } `json:"right"`
 		Options []struct {
 			ID   string   `json:"id"`
 			Tags []string `json:"tags"`
 		} `json:"options"`
+		Items []struct {
+			ID   string   `json:"id"`
+			Tags []string `json:"tags"`
+		} `json:"items"`
+		Stops []struct {
+			ID   string   `json:"id"`
+			Tags []string `json:"tags"`
+		} `json:"stops"`
+		Steps []struct {
+			Left  *struct{ Tags []string } `json:"left"`
+			Right *struct{ Tags []string } `json:"right"`
+		} `json:"steps"`
 	}
 	if err := json.Unmarshal([]byte(promptPayload), &payload); err != nil {
 		return nil
 	}
-	var choice string
+
+	var out []string
+	add := func(tags []string) { out = append(out, tags...) }
+
 	var decoded map[string]any
-	if json.Unmarshal([]byte(answer), &decoded) == nil {
-		if v, ok := decoded["choice"].(string); ok {
-			choice = v
-		}
-		if v, ok := decoded["optionId"].(string); ok {
-			choice = v
-		}
+	if json.Unmarshal([]byte(answer), &decoded) != nil {
+		return nil
 	}
-	switch choice {
-	case "left":
-		return payload.Left.Tags
-	case "right":
-		return payload.Right.Tags
-	}
-	for _, option := range payload.Options {
-		if option.ID == choice {
-			return option.Tags
+	if choice, ok := decoded["choice"].(string); ok {
+		if choice == "left" && payload.Left != nil {
+			add(payload.Left.Tags)
+		}
+		if choice == "right" && payload.Right != nil {
+			add(payload.Right.Tags)
 		}
 	}
-	return nil
+	if optionID, ok := decoded["optionId"].(string); ok {
+		for _, option := range payload.Options {
+			if option.ID == optionID {
+				add(option.Tags)
+			}
+		}
+		for _, item := range payload.Items {
+			if item.ID == optionID {
+				add(item.Tags)
+			}
+		}
+		for _, stop := range payload.Stops {
+			if stop.ID == optionID {
+				add(stop.Tags)
+			}
+		}
+	}
+	if stop, ok := decoded["stop"].(float64); ok {
+		index := int(stop)
+		if index >= 0 && index < len(payload.Stops) {
+			add(payload.Stops[index].Tags)
+		}
+	}
+	if rating, ok := decoded["rating"].(float64); ok {
+		index := int(rating) - 1
+		if index >= 0 && index < len(payload.Options) {
+			add(payload.Options[index].Tags)
+		}
+	}
+	if rawOrder, ok := decoded["order"].([]any); ok && len(rawOrder) > 0 {
+		if first, ok := rawOrder[0].(string); ok {
+			for _, item := range payload.Items {
+				if item.ID == first {
+					add(item.Tags)
+				}
+			}
+		}
+	}
+	if rawPath, ok := decoded["path"].([]any); ok {
+		for i, step := range payload.Steps {
+			if i >= len(rawPath) {
+				break
+			}
+			side, _ := rawPath[i].(string)
+			if side == "left" && step.Left != nil {
+				add(step.Left.Tags)
+			}
+			if side == "right" && step.Right != nil {
+				add(step.Right.Tags)
+			}
+		}
+	}
+	return out
 }
 
 // jaccardStrict is the Jaccard index with empty∪empty defined as 0.
