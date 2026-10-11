@@ -78,7 +78,8 @@ func (e *Engine) ScoreSession(ctx context.Context, sessionID string) (*Score, er
 	}
 
 	// P = personality traits; L = lifestyle traits + lifestyle.* picks;
-	// I = interest traits + favorite games + interest.* picks.
+	// I = interest traits + favorite games + interest.* picks; the four new
+	// axes are tag-derived only.
 	setP := func(axes map[string][]string) []string { return axes["personality"] }
 	jP := jaccardStrict(setP(axesA), setP(axesB))
 	lA := union(axesA["lifestyle"], keysWithPrefix(tagsA, "lifestyle."))
@@ -87,6 +88,10 @@ func (e *Engine) ScoreSession(ctx context.Context, sessionID string) (*Score, er
 	iA := union(axesA["interest"], gamesA, keysWithPrefix(tagsA, "interest."))
 	iB := union(axesB["interest"], gamesB, keysWithPrefix(tagsB, "interest."))
 	jI := jaccardStrict(iA, iB)
+	jV := jaccardStrict(keysWithPrefix(tagsA, "values."), keysWithPrefix(tagsB, "values."))
+	jPr := jaccardStrict(keysWithPrefix(tagsA, "priorities."), keysWithPrefix(tagsB, "priorities."))
+	jM := jaccardStrict(keysWithPrefix(tagsA, "mindset."), keysWithPrefix(tagsB, "mindset."))
+	jE := jaccardStrict(keysWithPrefix(tagsA, "energy."), keysWithPrefix(tagsB, "energy."))
 
 	statsA, err := e.Store.BehaviorStatsFor(ctx, a)
 	if err != nil {
@@ -109,13 +114,17 @@ func (e *Engine) ScoreSession(ctx context.Context, sessionID string) (*Score, er
 	}
 
 	const (
-		wP = 0.3125
-		wI = 0.25
-		wL = 0.1875
-		wB = 0.1875
-		wG = 0.0625
+		wP  = 0.15
+		wI  = 0.15
+		wV  = 0.15
+		wB  = 0.15
+		wL  = 0.10
+		wPr = 0.10
+		wM  = 0.10
+		wE  = 0.05
+		wG  = 0.05
 	)
-	score := wP*jP + wI*jI + wL*jL + wB*bSim + wG*location
+	score := wP*jP + wI*jI + wV*jV + wB*bSim + wL*jL + wPr*jPr + wM*jM + wE*jE + wG*location
 	if score < 0 {
 		score = 0
 	}
@@ -144,7 +153,7 @@ func (e *Engine) ScoreSession(ctx context.Context, sessionID string) (*Score, er
 		if len(answers) < 2 {
 			continue
 		}
-		if jsonEqual(answers[0].Payload, answers[1].Payload) {
+		if revealsSame(For(ses.Kind).Protocol, json.RawMessage(answers[0].Payload), json.RawMessage(answers[1].Payload)) {
 			sameRounds++
 		}
 		if roles, ok := gmaFor(round); ok {
@@ -185,6 +194,30 @@ func (e *Engine) ScoreSession(ctx context.Context, sessionID string) (*Score, er
 		default:
 			chips = append(chips, chip{"Similar interests", wI * jI})
 		}
+	}
+	// The four tag-derived axes reuse this session's game chip when it owns the
+	// axis, so the copy stays specific ("Closer than you'd think", not "values
+	// overlap").
+	sessionGame := For(ses.Kind)
+	axisChip := func(defaultChip, prefix string) string {
+		for _, owned := range sessionGame.TagPrefixes {
+			if owned == prefix && len(sessionGame.Chips) > 0 {
+				return sessionGame.Chips[0]
+			}
+		}
+		return defaultChip
+	}
+	if jV >= 0.5 {
+		chips = append(chips, chip{axisChip("Agree where it counts", "values."), wV * jV})
+	}
+	if jPr >= 0.5 {
+		chips = append(chips, chip{axisChip("Same number one", "priorities."), wPr * jPr})
+	}
+	if jM >= 0.5 {
+		chips = append(chips, chip{axisChip("On the same page", "mindset."), wM * jM})
+	}
+	if jE >= 0.5 {
+		chips = append(chips, chip{axisChip("Same speed", "energy."), wE * jE})
 	}
 	sort.SliceStable(chips, func(i, j int) bool { return chips[i].rank > chips[j].rank })
 
@@ -256,6 +289,10 @@ func (e *Engine) ScoreSession(ctx context.Context, sessionID string) (*Score, er
 		"personality": jP,
 		"interests":   jI,
 		"lifestyle":   jL,
+		"values":      jV,
+		"priorities":  jPr,
+		"mindset":     jM,
+		"energy":      jE,
 		"behavior":    bSim,
 		"location":    location,
 		"percent":     percent,

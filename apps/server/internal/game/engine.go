@@ -30,6 +30,7 @@ var (
 	ErrClosed      = errors.New("closed")
 	ErrNotFound    = errors.New("not found")
 	ErrNotYourTurn = errors.New("not your turn")
+	ErrBadAnswer   = errors.New("bad answer")
 )
 
 const (
@@ -80,11 +81,7 @@ func (e *Engine) revealRound(ctx context.Context, ses store.GameSession, round *
 
 // StartSession creates a session with its participants.
 func (e *Engine) StartSession(ctx context.Context, kind, mode string, userIDs []string) (store.GameSession, error) {
-	rounds := 8
-	switch kind {
-	case "twenty_questions", "guess_my_answer":
-		rounds = 6
-	}
+	rounds := RoundsFor(kind)
 	cfgJSON, _ := json.Marshal(map[string]any{"rounds": rounds, "countdown_ms": 3000, "reveal_ms": 4000})
 	ses := &store.GameSession{
 		Kind:         kind,
@@ -188,6 +185,15 @@ func (e *Engine) Answer(ctx context.Context, sessionID, userID string, payload j
 	body := string(payload)
 	if body == "" {
 		body = "null"
+	}
+	// A branch round needs a complete three-step path.
+	if For(ses.Kind).Protocol == ProtocolBranch {
+		var path struct {
+			Steps []string `json:"path"`
+		}
+		if err := json.Unmarshal(payload, &path); err != nil || len(path.Steps) != 3 {
+			return ErrBadAnswer
+		}
 	}
 	if err := e.Store.UpsertRoundAnswer(ctx, &store.RoundAnswer{RoundID: round.ID, UserID: userID, Payload: body}); err != nil {
 		return err
@@ -357,15 +363,7 @@ func (e *Engine) openRound(ctx context.Context, ses store.GameSession, index int
 		return err
 	}
 	if round == nil {
-		secs := 20 // twenty_questions
-		switch ses.Kind {
-		case "this_or_that":
-			secs = 8
-		case "guess_my_answer":
-			// The answer phase is short; the guess phase gets guessWindow.
-			secs = 8
-		}
-		answerBy := store.FmtTS(time.Now().UTC().Add(time.Duration(secs) * time.Second))
+		answerBy := store.FmtTS(time.Now().UTC().Add(TimerFor(ses.Kind)))
 		var promptID *string
 		if prompt != nil {
 			promptID = &prompt.ID
@@ -485,24 +483,13 @@ func (e *Engine) complete(ctx context.Context, ses store.GameSession) error {
 }
 
 func (e *Engine) houseAnswer(ctx context.Context, kind string, promptID *string) string {
-	if kind == "this_or_that" {
-		return `{"choice":"left"}`
+	if promptID == nil {
+		return string(firstOptionAnswer(nil))
 	}
-	optionID := "a"
-	if promptID != nil {
-		if p, err := e.Store.PromptByID(ctx, *promptID); err == nil && p != nil {
-			var payload struct {
-				Options []struct {
-					ID string `json:"id"`
-				} `json:"options"`
-			}
-			if err := json.Unmarshal([]byte(p.Payload), &payload); err == nil && len(payload.Options) > 0 {
-				optionID = payload.Options[0].ID
-			}
-		}
+	if prompt, err := e.Store.PromptByID(ctx, *promptID); err == nil && prompt != nil {
+		return string(HouseAnswerFor(kind, []byte(prompt.Payload)))
 	}
-	b, _ := json.Marshal(map[string]string{"optionId": optionID})
-	return string(b)
+	return string(firstOptionAnswer(nil))
 }
 
 // RunTicker advances active sessions and expires invites on an interval.
