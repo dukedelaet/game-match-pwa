@@ -7,8 +7,25 @@ import (
 	"strings"
 
 	"gamematch/internal/game"
-	"gamematch/internal/store"
 )
+
+// writeSessionError maps an engine failure to a response. A user who is not in
+// the session gets 403: the session IDs that reach clients are not secret, so
+// they are not access control.
+func writeSessionError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, game.ErrForbidden):
+		WriteError(w, http.StatusForbidden, "forbidden", "Not in session")
+	case errors.Is(err, game.ErrBadAnswer):
+		WriteError(w, http.StatusUnprocessableEntity, "bad_answer", "That answer is not complete")
+	case errors.Is(err, game.ErrNotYourTurn):
+		WriteError(w, http.StatusForbidden, "not_your_turn", "It is not your turn")
+	case errors.Is(err, game.ErrClosed):
+		WriteError(w, http.StatusConflict, "closed", "Not accepting answers")
+	default:
+		notFound(w)
+	}
+}
 
 func (s *Server) sessionJoin(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -38,12 +55,12 @@ func (s *Server) sessionShow(w http.ResponseWriter, r *http.Request) {
 	}
 	id := idParam(r)
 	if err := s.Engine.Heartbeat(ctx, id, u.ID); err != nil {
-		notFound(w)
+		writeSessionError(w, err)
 		return
 	}
 	view, err := s.Engine.View(ctx, id, u.ID)
 	if err != nil {
-		notFound(w)
+		writeSessionError(w, err)
 		return
 	}
 	WriteJSON(w, http.StatusOK, view)
@@ -62,28 +79,16 @@ func (s *Server) sessionAnswer(w http.ResponseWriter, r *http.Request) {
 		payload = json.RawMessage("[]")
 	}
 	if err := s.Engine.Heartbeat(ctx, id, u.ID); err != nil {
-		notFound(w)
+		writeSessionError(w, err)
 		return
 	}
 	if err := s.Engine.Answer(ctx, id, u.ID, payload); err != nil {
-		if errors.Is(err, game.ErrBadAnswer) {
-			WriteError(w, http.StatusUnprocessableEntity, "bad_answer", "That answer is not complete")
-			return
-		}
-		if errors.Is(err, game.ErrNotYourTurn) {
-			WriteError(w, http.StatusForbidden, "not_your_turn", "It is not your turn")
-			return
-		}
-		if errors.Is(err, game.ErrClosed) {
-			WriteError(w, http.StatusConflict, "closed", "Not accepting answers")
-			return
-		}
-		notFound(w)
+		writeSessionError(w, err)
 		return
 	}
 	view, err := s.Engine.View(ctx, id, u.ID)
 	if err != nil {
-		notFound(w)
+		writeSessionError(w, err)
 		return
 	}
 	WriteJSON(w, http.StatusOK, view)
@@ -91,20 +96,12 @@ func (s *Server) sessionAnswer(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) sessionLeave(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	u := currentUser(r)
 	id := idParam(r)
-	ses, err := s.Store.GetSession(ctx, id)
-	if err != nil {
-		notFound(w)
+	// Leaving forfeits the game for both players, so only a player may do it.
+	if err := s.Engine.Leave(ctx, id, u.ID); err != nil {
+		writeSessionError(w, err)
 		return
-	}
-	switch ses.State {
-	case "completed", "forfeit", "cancelled":
-	default:
-		ended := store.NowTS()
-		if err := s.Store.PutSessionState(ctx, id, "forfeit", &ended); err != nil {
-			WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
-			return
-		}
 	}
 	WriteJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

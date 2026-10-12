@@ -101,6 +101,12 @@ func (e *Engine) View(ctx context.Context, sessionID, userID string) (SessionVie
 
 // ViewNoAdvance builds the view without advancing (used after a locked call).
 func (e *Engine) buildView(ctx context.Context, sessionID, userID string) (SessionView, error) {
+	// Every path into a view goes through here, so this is where a non-player is
+	// stopped. Without it a caller defaults to seat 0 and is handed the other
+	// player's name, age, prompt and, at reveal time, their answers.
+	if err := e.requireParticipant(ctx, sessionID, userID); err != nil {
+		return SessionView{}, err
+	}
 	ses, err := e.Store.GetSession(ctx, sessionID)
 	if err != nil {
 		return SessionView{}, ErrNotFound
