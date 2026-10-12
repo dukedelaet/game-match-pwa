@@ -19,11 +19,17 @@ export default defineConfig({
         icons: [{ src: '/favicon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any' }],
       },
       workbox: {
-        navigateFallback: '/offline',
+        // Must be a precached build output. Workbox binds the fallback against
+        // the precache manifest while the worker is being evaluated and throws
+        // on a miss, so naming a client-side route here stops the worker from
+        // installing at all. The router renders /offline from the shell.
+        navigateFallback: '/index.html',
         globPatterns: ['**/*.{js,css,html,svg,ico,webp}'],
         // Registers the Web Push listeners alongside the generated worker.
         importScripts: ['push-sw.js'],
       },
+      // Surface worker-generation bugs in dev, where the worker otherwise never loads.
+      devOptions: { enabled: true },
     }),
   ],
   server: {
