@@ -44,6 +44,17 @@ type Server struct {
 	DisableRateLimits bool
 }
 
+// newSMS resolves the SMS provider. A configuration that cannot deliver on live
+// traffic yields a provider that rejects every send rather than one that logs
+// one-time codes to the journal.
+func newSMS(cfg config.Config) sms.Provider {
+	p, err := sms.NewChecked(cfg)
+	if err != nil {
+		log.Printf("sms: %v", err)
+	}
+	return p
+}
+
 // NewServer builds a Server.
 func NewServer(st *store.Store, engine *game.Engine, matcher *game.Matcher, cfg config.Config) *Server {
 	return &Server{
@@ -53,7 +64,7 @@ func NewServer(st *store.Store, engine *game.Engine, matcher *game.Matcher, cfg 
 		Cfg:       cfg,
 		PhotosDir: cfg.PhotosDir(),
 		Limiter:   ratelimit.New(st.DB),
-		SMS:       sms.New(cfg),
+		SMS:       newSMS(cfg),
 		Turnstile: turnstile.New(cfg.TurnstileSecret),
 		Push:      push.New(cfg),
 	}

@@ -6,6 +6,7 @@ package sms
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -25,10 +26,26 @@ type Provider interface {
 // self-hosted deploy needs no SMS account.
 type LogProvider struct{}
 
-// Send logs the code.
+// Send records that a message was produced. The body is deliberately never
+// logged: it contains the one-time code, and the journal is readable by anyone
+// in the systemd-journal group and by any log shipper.
 func (LogProvider) Send(_ context.Context, to, body string) error {
-	log.Printf("sms: to=%s body=%q (no SMS provider configured)", maskPhone(to), body)
+	log.Printf("sms: to=%s chars=%d (no SMS provider configured)", maskPhone(to), len(body))
 	return nil
+}
+
+// ErrNoProvider reports that no provider can deliver a message.
+var ErrNoProvider = errors.New("sms: no provider configured")
+
+// FatalLogProvider refuses to send. It stands in for a missing provider on live
+// traffic, where silently dropping codes would strand every user trying to sign
+// in.
+type FatalLogProvider struct{}
+
+// Send always fails without recording the body.
+func (FatalLogProvider) Send(_ context.Context, to, _ string) error {
+	log.Printf("sms: to=%s rejected (no SMS provider configured on this deployment)", maskPhone(to))
+	return ErrNoProvider
 }
 
 // TwilioProvider sends through the Twilio REST API.
@@ -71,17 +88,32 @@ func (p TwilioProvider) Send(ctx context.Context, to, body string) error {
 	return nil
 }
 
-// New picks a provider from configuration, falling back to logging.
+// New picks a provider from configuration, falling back to logging outside
+// production. Callers serving live traffic should use NewChecked.
 func New(cfg config.Config) Provider {
+	p, _ := NewChecked(cfg)
+	return p
+}
+
+// NewChecked picks a provider and refuses to return a log-only provider on
+// live traffic, so a half-configured Twilio account fails at boot instead of
+// writing one-time codes to the journal.
+func NewChecked(cfg config.Config) (Provider, error) {
 	if cfg.SMSProvider == "twilio" &&
 		cfg.TwilioAccountID != "" && cfg.TwilioAuthToken != "" && cfg.TwilioFrom != "" {
 		return TwilioProvider{
 			AccountSID: cfg.TwilioAccountID,
 			AuthToken:  cfg.TwilioAuthToken,
 			From:       cfg.TwilioFrom,
-		}
+		}, nil
 	}
-	return LogProvider{}
+	if cfg.IsProduction() {
+		return FatalLogProvider{}, fmt.Errorf(
+			"%w: SMS_PROVIDER=%q with account=%t token=%t from=%t; set a working provider before serving traffic",
+			ErrNoProvider, cfg.SMSProvider,
+			cfg.TwilioAccountID != "", cfg.TwilioAuthToken != "", cfg.TwilioFrom != "")
+	}
+	return LogProvider{}, nil
 }
 
 // maskPhone keeps only the last two digits so codes are not tied to a number in
