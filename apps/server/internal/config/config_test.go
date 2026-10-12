@@ -48,3 +48,55 @@ func TestLoadDerivesDataDirWhenUnset(t *testing.T) {
 	cfg := Load()
 	require.NotEmpty(t, cfg.DataDir)
 }
+
+func prodOK() Config {
+	return Config{
+		Env:             "production",
+		SMSProvider:     "twilio",
+		TwilioAccountID: "AC1",
+		TwilioAuthToken: "tok",
+		TwilioFrom:      "+15550000000",
+		TurnstileSecret: "0xsecret",
+	}
+}
+
+func TestValidateRejectsUnsafeProduction(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{"debug enabled", func(c *Config) { c.Debug = true }, "APP_DEBUG"},
+		{"dev otp set", func(c *Config) { c.DevOTP = "123456" }, "DEV_OTP"},
+		{"log sms provider", func(c *Config) { c.SMSProvider = "log" }, "SMS_PROVIDER"},
+		{"twilio without auth token", func(c *Config) { c.TwilioAuthToken = "" }, "TWILIO_AUTH_TOKEN"},
+		{"twilio without from", func(c *Config) { c.TwilioFrom = "" }, "TWILIO_FROM"},
+		{"turnstile missing", func(c *Config) { c.TurnstileSecret = "" }, "TURNSTILE_SECRET"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := prodOK()
+			tt.mutate(&cfg)
+			err := cfg.Validate()
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tt.want)
+		})
+	}
+}
+
+func TestValidateAcceptsSafeProduction(t *testing.T) {
+	require.NoError(t, prodOK().Validate())
+}
+
+func TestValidateAllowsInsecureSettingsOutsideProduction(t *testing.T) {
+	for _, env := range []string{"local", "test", "staging", ""} {
+		cfg := Config{Env: env, Debug: true, DevOTP: "123456", SMSProvider: "log"}
+		require.NoErrorf(t, cfg.Validate(), "env=%q", env)
+	}
+}
+
+func TestValidateRejectsUnknownEnv(t *testing.T) {
+	cfg := prodOK()
+	cfg.Env = "prduction"
+	require.Error(t, cfg.Validate())
+}
