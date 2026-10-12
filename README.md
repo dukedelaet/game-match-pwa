@@ -5,8 +5,8 @@ Play-first dating PWA. React front end, Go + SQLite backend.
 ## Local
 
 ```bash
-# requires Go 1.24+ and pnpm; `mise install` picks up the pinned toolchain
-cd apps/web && pnpm install
+# requires Go 1.27.2+ and pnpm; `mise install` picks up the pinned toolchain
+pnpm install
 
 cd apps/server && go run ./cmd/gamematch seed   # first run only
 go run ./cmd/gamematch                          # http://127.0.0.1:8000
@@ -42,8 +42,15 @@ cookie session (`gm_session`); OTP codes are returned as `devCode` when
 Environment: `ADDR`/`PORT` (default `127.0.0.1:8000`), `DATA_DIR` (default
 `apps/server/data`), `APP_ENV`, `APP_DEBUG`, `HOUSE_USER_ID`, `DEV_OTP`.
 
+With `APP_ENV=production` the service refuses to start unless `APP_DEBUG` is
+false, `DEV_OTP` is unset, and `SMS_PROVIDER` plus the Twilio and Turnstile
+credentials are all configured. Signing in is gated on the `auth.otp` and
+`auth.public_signup` feature flags, which migration `0008` seeds with safe
+defaults.
+
 ## Tests
 
 ```bash
 cd apps/server && go test ./...
+cd apps/web && pnpm test       # Vitest
 ```

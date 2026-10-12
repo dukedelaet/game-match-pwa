@@ -20,6 +20,7 @@ There is **no PHP, no Laravel, and no MySQL** in this repo. If you see those wor
 cd apps/server && go run ./cmd/gamematch          # serve on 127.0.0.1:8000
 cd apps/server && go run ./cmd/gamematch seed      # idempotent demo data
 cd apps/server && go test ./...                    # tests (add -race)
+cd apps/server && govulncheck ./...               # reachable CVEs
 cd apps/server && go test -coverpkg=./... ./internal/...   # coverage
 
 # Web
@@ -27,12 +28,15 @@ pnpm install
 pnpm --filter web dev        # Vite on 127.0.0.1:5173, proxies /v1 -> :8000
 pnpm --filter web build      # tsc -b && vite build
 pnpm --filter web lint       # oxlint
+pnpm --filter web test       # Vitest
 
 # Both at once
 bash scripts/dev.sh
 ```
 
-Toolchain is managed by mise (`mise install`): Go and pnpm are pinned there.
+Toolchain is managed by mise (`mise install`): Go 1.27.2, Node 24 and pnpm are
+pinned in `mise.toml` at the repo root. `apps/server/go.mod` also pins
+`toolchain go1.27.2`, so Go fetches the right toolchain even without mise.
 
 ## Conventions and gotchas
 
