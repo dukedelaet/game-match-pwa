@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"log"
 	"net/http"
 	"time"
 
@@ -122,9 +123,36 @@ func (s *Server) report(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if (body.Reason == "csam" || body.Reason == "underage") && body.UserID != "" {
-		if err := s.Store.SetUserStatus(ctx, body.UserID, "hidden"); err != nil {
-			WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
+		if body.UserID == u.ID {
+			// Reporting yourself should not be a route to the automatic hide.
+			WriteError(w, http.StatusUnprocessableEntity, "bad_report", "You cannot report yourself")
 			return
+		}
+		if _, err := s.Store.GetUser(ctx, body.UserID); err != nil {
+			// Do not confirm or deny that the account exists.
+			notFound(w)
+			return
+		}
+		// The report itself is never dropped and never rate limited -- dropping a
+		// real CSAM report is the worse failure. What is limited is the automated
+		// hide, which is what a reporter can weaponise: without this, one account
+		// could file unlimited reports and sweep any number of people out of
+		// matchmaking. Reports past the limit are still filed and still reach the
+		// moderation queue; they just wait for a human instead of acting at once.
+		//
+		// Two budgets: one per reporter (how many accounts one person may knock
+		// out of rotation) and one per subject (so N reports about one person
+		// cannot produce N hide actions).
+		switch {
+		case !s.withinLimit(r, "hide:"+u.ID, limitHidesPerReporter, windowHides):
+			log.Printf("reports: reporter %s exceeded the automatic-hide budget; report queued for review", u.ID)
+		case !s.withinLimit(r, "hide:subject:"+body.UserID, limitHidesPerSubject, windowHides):
+			log.Printf("reports: subject %s already hidden by automation; review queued", body.UserID)
+		default:
+			if err := s.Store.SetUserStatus(ctx, body.UserID, "hidden"); err != nil {
+				WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
+				return
+			}
 		}
 		reportID := rep.ID
 		purge := store.FmtTS(time.Now().UTC().Add(90 * 24 * time.Hour))
