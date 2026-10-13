@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/google/uuid"
@@ -112,4 +114,23 @@ func orderedPairID(t *testing.T, st *store.Store, a, b string) string {
 	require.NoError(t, st.DB.GetContext(context.Background(), &id,
 		`SELECT id FROM pair_relationships WHERE user_a = ? AND user_b = ?`, first, second))
 	return id
+}
+
+// End to end: a photo uploaded over HTTP must land on disk owner-readable
+// only. The unit tests cover the helpers; this proves the upload path uses them.
+func TestUploadedPhotoIsNotWorldReadableOnDisk(t *testing.T) {
+	s, _ := newTestServer(t)
+	alex := login(t, s, "+15551111111")
+
+	photoID := uploadPhotoID(t, alex)
+
+	var path string
+	require.NoError(t, s.Store.DB.GetContext(context.Background(), &path,
+		`SELECT path FROM photos WHERE id = ?`, photoID))
+
+	abs := filepath.Join(s.PhotosDir, filepath.FromSlash(path))
+	info, err := os.Stat(abs)
+	require.NoError(t, err)
+	require.Zero(t, info.Mode().Perm()&0o004, "uploaded photo is world-readable: %v", info.Mode().Perm())
+	require.Zero(t, info.Mode().Perm()&0o002, "uploaded photo is world-writable: %v", info.Mode().Perm())
 }

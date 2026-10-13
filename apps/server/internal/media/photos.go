@@ -6,6 +6,8 @@ import (
 	"image"
 	"image/jpeg"
 	"io"
+	"os"
+	"path/filepath"
 
 	"github.com/disintegration/imaging"
 	_ "golang.org/x/image/webp"
@@ -82,4 +84,45 @@ func readHeader(r io.Reader) (header []byte, rest io.Reader, err error) {
 	// The prefix has already been consumed from r, so rest is just what follows
 	// it. The caller replays the prefix with a MultiReader of its own.
 	return header, r, nil
+}
+
+// File modes for stored photos. These are intimate images on a dating app: at
+// 0644 and 0755 any local user, and any process sharing the host or a container
+// volume, can read every one of them. Only the service user needs access.
+const (
+	dirPerm  os.FileMode = 0o750
+	filePerm os.FileMode = 0o640
+)
+
+// MkdirAll creates a directory tree that is not readable outside its group.
+func MkdirAll(path string) error {
+	return os.MkdirAll(path, dirPerm)
+}
+
+// WriteFile stores a photo with owner-only read/write.
+func WriteFile(path string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), dirPerm); err != nil {
+		return err
+	}
+	// O_EXCL semantics via the mode argument only apply on creation; write to a
+	// temp name and rename so a reader never sees a partial image, and so an
+	// existing file keeps its tighter mode.
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".photo-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, filePerm); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
