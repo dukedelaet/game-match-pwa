@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { readFileSync, existsSync } from 'node:fs'
 import { resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
 
 // vite-plugin-pwa emits `createHandlerBoundToURL(url)` for navigateFallback at the
 // top level of the generated worker. Workbox resolves that against the precache
@@ -13,8 +12,9 @@ import { fileURLToPath } from 'node:url'
 // Asserting on vite.config.ts instead would not catch a plugin that changed how
 // it resolves the URL.
 
-const here = fileURLToPath(new URL('.', import.meta.url))
-const distDir = resolve(here, '..', '..', 'dist')
+// process.cwd() is the package root under vitest, in both the node and jsdom
+// environments; fileURLToPath on import.meta.url is not reliable under jsdom.
+const distDir = resolve(process.cwd(), 'dist')
 const swPath = resolve(distDir, 'sw.js')
 const built = existsSync(swPath)
 

@@ -149,7 +149,10 @@ func TestDeleteAccountBlockedByLegalHold(t *testing.T) {
 	alex := login(t, s, "+15551111111")
 	alexID := mustUserIDByPhone(t, st, "+15551111111")
 
-	code, body := alex.json(http.MethodPost, "/v1/reports", map[string]any{
+	// Reported by someone else: an account cannot file a safety report against
+	// itself.
+	reporter := login(t, s, "+15552222222")
+	code, body := reporter.json(http.MethodPost, "/v1/reports", map[string]any{
 		"reason": "csam", "userId": alexID,
 	})
 	require.Equal(t, http.StatusOK, code, "report body: %v", body)

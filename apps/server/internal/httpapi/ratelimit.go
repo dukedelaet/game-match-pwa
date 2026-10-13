@@ -109,3 +109,12 @@ func clientIP(r *http.Request) string {
 	}
 	return host
 }
+
+// Safety reports are never rate limited themselves -- dropping a real report is
+// worse than a slow queue. These bound only the automatic hide a report
+// triggers, which is the part a malicious reporter can weaponise.
+const (
+	limitHidesPerReporter = 3
+	limitHidesPerSubject  = 1
+	windowHides           = 24 * time.Hour
+)
