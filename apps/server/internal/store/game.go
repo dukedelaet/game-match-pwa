@@ -312,7 +312,10 @@ func AgeOfDays(dob string, now time.Time) int {
 		return 0
 	}
 	years := now.Year() - t.Year()
-	if now.YearDay() < t.YearDay() {
+	// Compare the birthday of this year with today's date. Comparing YearDay values is
+	// wrong near New Year: a birthday in late December has a larger YearDay than any
+	// date in January, so the age was one short until the birthday came round again.
+	if t.AddDate(years, 0, 0).After(now) {
 		years--
 	}
 	return years
