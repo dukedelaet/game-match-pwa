@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the GameMatch backup hourly
+Documentation=https://github.com/dukedelaet/game-match-pwa
+
+[Timer]
+OnCalendar=hourly
+# Spread the run off the top of the hour and survive downtime: a missed window
+# (host off, timer not running) catches up on the next boot.
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

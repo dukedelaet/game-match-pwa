@@ -19,6 +19,9 @@ import (
 
 func main() {
 	cfg := config.Load()
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("config: %v", err)
+	}
 
 	conn, err := db.Open(cfg.DBPath())
 	if err != nil {

@@ -138,20 +138,63 @@ func (e *Engine) Join(ctx context.Context, sessionID, userID string) error {
 	return nil
 }
 
+// requireParticipant rejects a user who is not in the session. Session IDs reach
+// clients in Completed.SessionID, ResumeToken, push payloads and the PWA URL, so
+// holding a valid account is not evidence of being one of the players.
+func (e *Engine) requireParticipant(ctx context.Context, sessionID, userID string) error {
+	p, err := e.Store.Participant(ctx, sessionID, userID)
+	if err != nil {
+		return err
+	}
+	if p == nil {
+		return ErrForbidden
+	}
+	return nil
+}
+
 // Heartbeat records a poll and advances the session.
 func (e *Engine) Heartbeat(ctx context.Context, sessionID, userID string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if err := e.requireParticipant(ctx, sessionID, userID); err != nil {
+		return err
+	}
 	if err := e.Store.TouchPoll(ctx, sessionID, userID); err != nil {
 		return err
 	}
 	return e.advanceLocked(ctx, sessionID)
 }
 
+// Leave forfeits an unfinished session. Only a participant may do it, since the
+// action ends the game for the other player too.
+func (e *Engine) Leave(ctx context.Context, sessionID, userID string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := e.requireParticipant(ctx, sessionID, userID); err != nil {
+		return err
+	}
+	ses, err := e.Store.GetSession(ctx, sessionID)
+	if err != nil {
+		return ErrNotFound
+	}
+	switch ses.State {
+	case "completed", "forfeit", "cancelled":
+		return nil
+	}
+	ended := store.NowTS()
+	if err := e.Store.PutSessionState(ctx, sessionID, "forfeit", &ended); err != nil {
+		return err
+	}
+	return nil
+}
+
 // Answer records a player's answer and advances the session.
 func (e *Engine) Answer(ctx context.Context, sessionID, userID string, payload json.RawMessage) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if err := e.requireParticipant(ctx, sessionID, userID); err != nil {
+		return err
+	}
 	if err := e.advanceLocked(ctx, sessionID); err != nil {
 		return err
 	}

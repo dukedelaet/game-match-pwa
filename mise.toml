@@ -1,0 +1,13 @@
+# Pinned toolchain. README and AGENTS.md both promise `mise install` resolves
+# these versions; without this file they resolve from whatever the developer's
+# global mise config happens to say, which is how a build with 10 known
+# stdlib CVEs shipped.
+[tools]
+go = "1.27.2"
+node = "24"
+pnpm = "12.9.1"
+
+[env]
+# The SQLite driver is pure Go. Keeping cgo off means the binary builds and
+# runs anywhere, including distroless and scratch images.
+CGO_ENABLED = "0"
