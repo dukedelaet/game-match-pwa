@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"gamematch/internal/config"
@@ -55,13 +58,55 @@ func main() {
 	engine := game.NewEngine(st, cfg)
 	matcher := game.NewMatcher(st, cfg)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// SIGTERM is how systemd stops the service, which is how every deploy
+	// happens. Without a handler the process dies mid-request.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	go engine.RunTicker(ctx, 5*time.Second)
 
-	server := httpapi.NewServer(st, engine, matcher, cfg)
+	srv := newHTTPServer(cfg.Addr, httpapi.NewServer(st, engine, matcher, cfg).Router())
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer close(shutdownDone)
+		<-ctx.Done()
+		log.Printf("shutdown: draining")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("shutdown: %v", err)
+		}
+	}()
+
 	log.Printf("gamematch listening on http://%s (data dir %s, debug=%t)", cfg.Addr, cfg.DataDir, cfg.Debug)
-	if err := http.ListenAndServe(cfg.Addr, server.Router()); err != nil {
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("serve: %v", err)
+	}
+
+	// Wait for in-flight requests so the database is not closed underneath them.
+	select {
+	case <-shutdownDone:
+	case <-time.After(shutdownGrace):
+		log.Printf("shutdown: timed out waiting for drain")
+	}
+}
+
+// shutdownGrace bounds how long a restart may spend draining.
+const shutdownGrace = 25 * time.Second
+
+// newHTTPServer builds the HTTP server with the timeouts it was missing.
+// Without them the zero values mean unlimited, so a handful of connections
+// that never finish their headers hold goroutines indefinitely.
+func newHTTPServer(addr string, h http.Handler) *http.Server {
+	return &http.Server{
+		Addr:    addr,
+		Handler: h,
+		// Bounds the window between accepting a connection and receiving the
+		// request headers, which is what a slow-loris attack holds open.
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 }
