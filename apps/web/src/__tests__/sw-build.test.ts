@@ -51,6 +51,33 @@ describe.skipIf(!built)('generated service worker', () => {
     expect(precachedUrls(source)).toContain('index.html')
   })
 
+  // autoUpdate emitted skipWaiting() + clientsClaim(), swapping the worker under
+  // a live game. The update must wait for the user.
+  it('holds the new worker instead of swapping it under open tabs', () => {
+    expect(source).toContain('skipWaiting')
+    expect(source, 'autoUpdate implies skipWaiting(); prompt mode must not').not.toContain('clientsClaim()')
+  })
+
+  it('ships the icons an install prompt needs', () => {
+    const manifest = JSON.parse(readFileSync(resolve(distDir, 'manifest.webmanifest'), 'utf8'))
+    const pngs = manifest.icons.filter((i: { type: string }) => i.type === 'image/png')
+    const sizes = pngs.map((i: { sizes: string }) => i.sizes)
+
+    expect(sizes).toContain('192x192')
+    expect(sizes).toContain('512x512')
+    expect(pngs.some((i: { purpose: string }) => i.purpose === 'maskable')).toBe(true)
+
+    // The files must actually exist, or the install prompt offers a broken icon.
+    for (const icon of pngs) {
+      expect(existsSync(resolve(distDir, icon.src.replace(/^\//, '')))).toBe(true)
+    }
+  })
+
+  it('ships an apple-touch-icon so iOS does not screenshot the page', () => {
+    const html = readFileSync(resolve(distDir, 'index.html'), 'utf8')
+    expect(html).toContain('apple-touch-icon')
+  })
+
   it('keeps the push worker alongside the generated worker', () => {
     expect(source).toContain('importScripts("push-sw.js")')
     expect(precachedUrls(source)).toContain('push-sw.js')
