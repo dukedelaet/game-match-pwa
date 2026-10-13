@@ -13,6 +13,7 @@ import { api, ApiError, NetworkError, type Me } from './api'
 import { enablePush, pushResultMessage } from './push'
 import { useInstallPrompt } from './useInstallPrompt'
 import { startPolling } from './polling'
+import { DEMO_PHONE, DEMO_CODE, DEMO_HINT, SHOW_DEMO_OAUTH } from './demo'
 
 /**
  * Fetch the signed-in user, or bounce to sign in.
@@ -59,7 +60,7 @@ function Shell() {
 
 function Welcome() {
   const nav = useNavigate()
-  const [phone, setPhone] = useState('+15551111111')
+  const [phone, setPhone] = useState(DEMO_PHONE)
   const [code, setCode] = useState('')
   const [step, setStep] = useState<'phone' | 'code'>('phone')
   const [err, setErr] = useState('')
@@ -96,30 +97,44 @@ function Welcome() {
           <button className="w-full rounded-2xl bg-fuchsia-500 py-3 font-bold text-white shadow-[0_0_24px_#d946ef]" onClick={start}>
             Create account / log in
           </button>
-          <button
-            className="w-full rounded-2xl bg-white py-3 font-bold text-black"
-            onClick={async () => {
-              const r = await api.post('/v1/auth/oauth/apple')
-              nav({ to: r.user.onboardingStep === 'done' ? '/home' : '/onboarding' })
-            }}
-          >
-            Continue with Apple
-          </button>
-          <button
-            className="w-full rounded-2xl bg-white/10 py-3 font-bold"
-            onClick={async () => {
-              const r = await api.post('/v1/auth/oauth/google')
-              nav({ to: r.user.onboardingStep === 'done' ? '/home' : '/onboarding' })
-            }}
-          >
-            Continue with Google
-          </button>
-          <p className="text-xs text-white/50">Demo: Alex +15551111111 · Jordan +15552222222 · code 123456. Apple/Google are local stand-ins until real keys are set.</p>
+          {/* These call an endpoint that only exists while APP_DEBUG is set, so
+              showing them in production offered two buttons that always failed. */}
+          {SHOW_DEMO_OAUTH && (
+            <>
+              <button
+                className="w-full rounded-2xl bg-white py-3 font-bold text-black"
+                onClick={async () => {
+                  try {
+                    const r = await api.post('/v1/auth/oauth/apple')
+                    nav({ to: r.user.onboardingStep === 'done' ? '/home' : '/onboarding' })
+                  } catch (e) {
+                    setErr(errorText(e, 'Sign-in failed.'))
+                  }
+                }}
+              >
+                Continue with Apple
+              </button>
+              <button
+                className="w-full rounded-2xl bg-white/10 py-3 font-bold"
+                onClick={async () => {
+                  try {
+                    const r = await api.post('/v1/auth/oauth/google')
+                    nav({ to: r.user.onboardingStep === 'done' ? '/home' : '/onboarding' })
+                  } catch (e) {
+                    setErr(errorText(e, 'Sign-in failed.'))
+                  }
+                }}
+              >
+                Continue with Google
+              </button>
+            </>
+          )}
+          {DEMO_HINT && <p className="text-xs text-white/50">{DEMO_HINT}</p>}
         </div>
       ) : (
         <div className="mt-10 space-y-3">
           <p className="text-sm text-fuchsia-200">{hint}</p>
-          <input className="w-full rounded-2xl bg-white/10 px-4 py-3 tracking-[0.4em]" value={code} onChange={(e) => setCode(e.target.value)} placeholder="123456" />
+          <input className="w-full rounded-2xl bg-white/10 px-4 py-3 tracking-[0.4em]" value={code} onChange={(e) => setCode(e.target.value)} placeholder={DEMO_CODE} />
           <button className="w-full rounded-2xl bg-fuchsia-500 py-3 font-bold" onClick={verify}>
             Continue
           </button>

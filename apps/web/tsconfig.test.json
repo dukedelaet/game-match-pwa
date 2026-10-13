@@ -2,9 +2,14 @@
   "compilerOptions": {
     "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.test.tsbuildinfo",
     "target": "es2023",
-    "lib": ["ES2023"],
+    "lib": [
+      "ES2023"
+    ],
     "module": "esnext",
-    "types": ["node"],
+    "types": [
+      "node",
+      "vite/client"
+    ],
     "moduleResolution": "bundler",
     "verbatimModuleSyntax": true,
     "moduleDetection": "force",
@@ -12,5 +17,9 @@
     "skipLibCheck": true,
     "strict": true
   },
-  "include": ["src/**/*.test.ts", "src/**/*.test.tsx", "src/test/**/*"]
+  "include": [
+    "src/**/*.test.ts",
+    "src/**/*.test.tsx",
+    "src/test/**/*"
+  ]
 }
