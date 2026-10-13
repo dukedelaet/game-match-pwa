@@ -91,9 +91,6 @@ func (s *Server) patchMe(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.OnboardingStep != nil && *body.OnboardingStep != "" {
 		u.OnboardingStep = *body.OnboardingStep
-		if *body.OnboardingStep == "done" {
-			u.Status = "active"
-		}
 	}
 	if body.Incognito != nil {
 		u.Incognito = *body.Incognito
@@ -104,6 +101,16 @@ func (s *Server) patchMe(w http.ResponseWriter, r *http.Request) {
 	if err := s.Store.UpdateUser(ctx, u); err != nil {
 		WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
 		return
+	}
+	// Finishing onboarding admits the account to matchmaking. This is a server
+	// decision, never a field the client writes: users.status is also what
+	// moderation sets to 'hidden', and letting PATCH /v1/me drive it let a
+	// reported user walk themselves straight back to active.
+	if body.OnboardingStep != nil && *body.OnboardingStep == "done" {
+		if err := s.Store.ActivateIfNotModerated(ctx, u.ID); err != nil {
+			WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
+			return
+		}
 	}
 
 	profile, err := s.Store.ProfileFor(ctx, u.ID)
