@@ -7,52 +7,77 @@ import (
 	"gamematch/internal/store"
 )
 
+// threads lists the caller's conversations with their last message and the
+// other person.
+//
+// This was 4 + 5N statements -- a pass per match for the block check, the
+// thread, the last message and the other user's card -- with no LIMIT.
 func (s *Server) threads(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	u := currentUser(r)
-	matches, err := s.Store.MutualMatchesFor(ctx, u.ID)
+
+	matches, err := s.Store.MutualMatchesForLimited(ctx, u.ID, listLimit(r))
 	if err != nil {
 		WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
 		return
 	}
 	items := []ThreadItem{}
+	if len(matches) == 0 {
+		WriteJSON(w, http.StatusOK, map[string]any{"items": items})
+		return
+	}
+
+	otherIDs := make([]string, 0, len(matches))
+	matchIDs := make([]string, 0, len(matches))
 	for _, m := range matches {
-		blocked, err := s.Store.BlockedEitherWay(ctx, m.UserA, m.UserB)
-		if err != nil {
-			WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
-			return
+		other := m.UserA
+		if u.ID == m.UserA {
+			other = m.UserB
 		}
-		if blocked {
+		otherIDs = append(otherIDs, other)
+		matchIDs = append(matchIDs, m.ID)
+	}
+
+	blocked, err := s.visibleTo(ctx, u.ID, otherIDs)
+	if err != nil {
+		WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
+		return
+	}
+	threads, err := s.Store.ThreadsForMatches(ctx, matchIDs)
+	if err != nil {
+		WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
+		return
+	}
+	threadIDs := make([]string, 0, len(matches))
+	for _, th := range threads {
+		if th != nil {
+			threadIDs = append(threadIDs, th.ID)
+		}
+	}
+	lasts, err := s.Store.LastMessagesForThreads(ctx, threadIDs)
+	if err != nil {
+		WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
+		return
+	}
+	cards, err := s.cardsFor(ctx, otherIDs)
+	if err != nil {
+		WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
+		return
+	}
+
+	for i, m := range matches {
+		if blocked[otherIDs[i]] {
 			continue
 		}
-		thread, err := s.Store.ThreadForMatch(ctx, m.ID)
-		if err != nil {
-			WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
-			return
-		}
-		otherID := m.UserA
-		if u.ID == m.UserA {
-			otherID = m.UserB
-		}
 		item := ThreadItem{MatchID: m.ID}
-		if thread != nil {
-			item.ThreadID = &thread.ID
-			item.State = &thread.State
-			last, err := s.Store.LastMessage(ctx, thread.ID)
-			if err != nil {
-				WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
-				return
-			}
-			if last != nil {
+		if th := threads[m.ID]; th != nil {
+			item.ThreadID = &th.ID
+			item.State = &th.State
+			if last := lasts[th.ID]; last != nil {
 				item.Last = &LastMessage{Body: last.Body, Kind: last.Kind, At: last.CreatedAt}
 			}
 		}
-		card, err := s.card(ctx, otherID)
-		if err != nil {
-			WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
-			return
-		}
-		item.Other = card
+		item.Other = cards[otherIDs[i]]
 		items = append(items, item)
 	}
 	WriteJSON(w, http.StatusOK, map[string]any{"items": items})

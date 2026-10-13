@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strconv"
+	"strings"
 
 	"github.com/google/uuid"
 )
@@ -256,4 +258,162 @@ func (s *Store) CountTextMessages(ctx context.Context, threadID string) (int, er
 func (s *Store) ClearMatchExpiry(ctx context.Context, matchID string) error {
 	_, err := s.DB.ExecContext(ctx, `UPDATE matches SET expires_at = NULL, updated_at = ? WHERE id = ?`, NowTS(), matchID)
 	return err
+}
+
+// DefaultListLimit bounds every list endpoint. Without a limit these returned
+// the user's entire history in one response.
+const DefaultListLimit = 50
+
+// MaxListLimit is the largest a caller may request.
+const MaxListLimit = 100
+
+// ClampListLimit normalises a caller-supplied limit: anything zero, negative or
+// unparseable falls back to the default, and anything above the maximum is
+// capped rather than honoured. A value too large for an int is treated as
+// "very large" rather than unparseable, so ?limit=999999999999999999999 means
+// "as much as you allow" instead of the default.
+func ClampListLimit(raw string) int {
+	if raw == "" {
+		return DefaultListLimit
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		// Overflow, or not a number. A leading digit decides which: a huge
+		// number is a clamped request, anything else is junk.
+		for _, r := range raw {
+			if r < '0' || r > '9' {
+				return DefaultListLimit
+			}
+		}
+		if len(raw) > 1 && raw[0] == '0' {
+			return DefaultListLimit
+		}
+		return MaxListLimit
+	}
+	if n <= 0 {
+		return DefaultListLimit
+	}
+	if n > MaxListLimit {
+		return MaxListLimit
+	}
+	return n
+}
+
+// MutualMatchesForLimited is MutualMatchesFor with a row cap.
+func (s *Store) MutualMatchesForLimited(ctx context.Context, userID string, limit int) ([]Match, error) {
+	out := []Match{}
+	err := s.DB.SelectContext(ctx, &out, `
+		SELECT * FROM matches WHERE state = 'mutual' AND (user_a = ? OR user_b = ?)
+		ORDER BY matched_at DESC LIMIT ?`, userID, userID, limit)
+	return out, err
+}
+
+// PairsForUserLimited is PairsForUser with a row cap.
+func (s *Store) PairsForUserLimited(ctx context.Context, userID string, limit int) ([]Pair, error) {
+	out := []Pair{}
+	err := s.DB.SelectContext(ctx, &out, `
+		SELECT * FROM pair_relationships WHERE user_a = ? OR user_b = ?
+		ORDER BY created_at DESC LIMIT ?`, userID, userID, limit)
+	return out, err
+}
+
+// ThreadsForMatches loads every thread for a set of matches in one query, keyed
+// by match ID. Threads were previously fetched one at a time.
+func (s *Store) ThreadsForMatches(ctx context.Context, matchIDs []string) (map[string]*Thread, error) {
+	out := make(map[string]*Thread, len(matchIDs))
+	if len(matchIDs) == 0 {
+		return out, nil
+	}
+	var rows []Thread
+	q, args, err := sqlxIn(`SELECT * FROM chat_threads WHERE match_id IN (?)`, matchIDs)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.DB.SelectContext(ctx, &rows, q, args...); err != nil {
+		return nil, err
+	}
+	for i := range rows {
+		r := rows[i]
+		out[r.MatchID] = &r
+	}
+	return out, nil
+}
+
+// PairsForPeople loads pair relationships for a set of ordered (a,b) pairs in
+// one query. Pairs were previously fetched one at a time.
+//
+// The pairs are matched with OR'd comparisons rather than a row-value IN list:
+// sqlx.In cannot expand a variadic number of arguments inside a tuple, which
+// SQLite rejects at runtime with "IN(...) element has 1 term - expected 2".
+func (s *Store) PairsForPeople(ctx context.Context, pairs [][2]string) (map[string]*Pair, error) {
+	out := make(map[string]*Pair, len(pairs))
+	if len(pairs) == 0 {
+		return out, nil
+	}
+	clauses := make([]string, 0, len(pairs))
+	args := make([]any, 0, len(pairs)*2)
+	for _, p := range pairs {
+		clauses = append(clauses, "(user_a = ? AND user_b = ?)")
+		args = append(args, p[0], p[1])
+	}
+	var rows []Pair
+	query := `SELECT * FROM pair_relationships WHERE ` + strings.Join(clauses, " OR ")
+	if err := s.DB.SelectContext(ctx, &rows, query, args...); err != nil {
+		return nil, err
+	}
+	for i := range rows {
+		r := rows[i]
+		out[PairKey(r.UserA, r.UserB)] = &r
+	}
+	return out, nil
+}
+
+// PairKey identifies an ordered pair of users.
+func PairKey(a, b string) string { return a + "\x00" + b }
+
+// LastMessagesForThreads returns the most recent message for each thread in one
+// query. LastMessage issued one statement per thread.
+func (s *Store) LastMessagesForThreads(ctx context.Context, threadIDs []string) (map[string]*Message, error) {
+	out := make(map[string]*Message, len(threadIDs))
+	if len(threadIDs) == 0 {
+		return out, nil
+	}
+	var rows []Message
+	q, args, err := sqlxIn(`
+		SELECT m.* FROM messages m
+		JOIN (SELECT thread_id, MAX(created_at) AS newest FROM messages
+		      WHERE thread_id IN (?) GROUP BY thread_id) latest
+		  ON m.thread_id = latest.thread_id AND m.created_at = latest.newest`,
+		threadIDs)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.DB.SelectContext(ctx, &rows, q, args...); err != nil {
+		return nil, err
+	}
+	for i := range rows {
+		r := rows[i]
+		existing, seen := out[r.ThreadID]
+		if !seen || messageNewer(&r, existing) {
+			cp := r
+			out[r.ThreadID] = &cp
+		}
+	}
+	return out, nil
+}
+
+// messageNewer mirrors LastMessage's "ORDER BY created_at DESC, rowid DESC".
+// rowid is monotonic within a table, so comparing ids is a stable proxy.
+func messageNewer(a, b *Message) bool {
+	as, bs := "", ""
+	if a.CreatedAt != nil {
+		as = *a.CreatedAt
+	}
+	if b.CreatedAt != nil {
+		bs = *b.CreatedAt
+	}
+	if as != bs {
+		return as > bs
+	}
+	return a.ID > b.ID
 }
