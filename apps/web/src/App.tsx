@@ -9,17 +9,37 @@ import {
   useNavigate,
   redirect,
 } from '@tanstack/react-router'
-import { api, type Me } from './api'
+import { api, ApiError, NetworkError, type Me } from './api'
 import { enablePush, pushResultMessage } from './push'
 import { useInstallPrompt } from './useInstallPrompt'
 
+/**
+ * Fetch the signed-in user, or bounce to sign in.
+ *
+ * Only a genuine 401 means "not signed in". A 500, a 429 or a dropped connection
+ * used to land in the same catch and log the user out of the UI, mid-game if it
+ * happened during a navigation, with no message and no retry.
+ */
 async function requireUser() {
   try {
     const { user } = await api.get('/v1/auth/session')
     return user as Me
-  } catch {
-    throw redirect({ to: '/' })
+  } catch (err) {
+    if (err instanceof ApiError && err.isUnauthorized) {
+      throw redirect({ to: '/' })
+    }
+    // Transient: keep the user where they are and surface a retry instead of
+    // pretending they signed out.
+    throw err
   }
+}
+
+/** Human-readable text for anything a request can reject with. */
+function errorText(err: unknown, fallback = 'Something went wrong'): string {
+  if (err instanceof ApiError) return err.message
+  if (err instanceof NetworkError) return 'Connection lost. Check your network and try again.'
+  if (err instanceof Error && err.message) return err.message
+  return fallback
 }
 
 function Shell() {
@@ -124,10 +144,20 @@ function Onboarding() {
   const [err, setErr] = useState('')
 
   useEffect(() => {
-    api.get('/v1/catalogs').then((c) => {
-      setCats(c)
-      setMetro(c.metros[0]?.id)
-    })
+    let live = true
+    api
+      .get('/v1/catalogs')
+      .then((c) => {
+        if (!live) return
+        setCats(c)
+        setMetro(c.metros[0]?.id)
+      })
+      .catch((e) => {
+        if (live) setErr(errorText(e, 'Could not load the sign-up questions.'))
+      })
+    return () => {
+      live = false
+    }
   }, [])
 
   const toggle = (arr: string[], v: string, max: number) =>
@@ -154,7 +184,22 @@ function Onboarding() {
     nav({ to: '/home' })
   }
 
-  if (!cats) return <p className="p-8">Loading…</p>
+  if (!cats) {
+    // A failed load previously left this on "Loading…" forever.
+    return (
+      <div className="space-y-4 p-8">
+        <p className="text-rose-300">{err || 'Loading…'}</p>
+        {err && (
+          <button
+            className="rounded-2xl bg-fuchsia-500 px-6 py-3 font-bold"
+            onClick={() => window.location.reload()}
+          >
+            Try again
+          </button>
+        )}
+      </div>
+    )
+  }
   const screens = [
     <div key="i" className="space-y-4">
       <h2 className="text-2xl font-black">What brings you here?</h2>
