@@ -128,3 +128,11 @@ const (
 func rlBucket(prefix, suffix string) string {
 	return prefix + store.BucketDigest(suffix)
 }
+
+// The queue status endpoint is polled by the PWA and drives a matching pass, so
+// it is the most expensive GET in the API. It previously had no limit at all,
+// which let one account hold the single-writer SQLite busy by polling it.
+const (
+	limitQueueStatusPerUser = 4
+	windowQueueStatus       = time.Second
+)

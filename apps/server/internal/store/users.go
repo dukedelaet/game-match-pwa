@@ -324,3 +324,130 @@ func (s *Store) ActivateIfNotModerated(ctx context.Context, userID string) error
 		WHERE id=? AND status NOT IN (`+placeholders+`)`, append([]any{NowTS()}, args...)...)
 	return err
 }
+
+// UsersByIDs loads many users in one query. Matching used to call GetUser once
+// per candidate, which made the cost of a matching pass grow with the queue.
+func (s *Store) UsersByIDs(ctx context.Context, ids []string) (map[string]User, error) {
+	out := make(map[string]User, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	var rows []User
+	q, args, err := sqlxIn(`SELECT * FROM users WHERE id IN (?)`, ids)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.DB.SelectContext(ctx, &rows, q, args...); err != nil {
+		return nil, err
+	}
+	for _, u := range rows {
+		out[u.ID] = u
+	}
+	return out, nil
+}
+
+// BlockedPairs returns the subset of candidates blocked either way against user,
+// so the matching loop does not issue one query per pair.
+func (s *Store) BlockedPairs(ctx context.Context, user string, others []string) (map[string]bool, error) {
+	out := make(map[string]bool, len(others))
+	if len(others) == 0 {
+		return out, nil
+	}
+	var rows []struct {
+		BlockerID string `db:"blocker_id"`
+		BlockedID string `db:"blocked_id"`
+	}
+	ids := append([]string{user}, others...)
+	q, args, err := sqlxIn(
+		`SELECT blocker_id, blocked_id FROM blocks
+		 WHERE blocker_id IN (?) AND blocked_id IN (?)`, ids, ids)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.DB.SelectContext(ctx, &rows, q, args...); err != nil {
+		return nil, err
+	}
+	for _, r := range rows {
+		// Either direction blocks the pair.
+		out[r.BlockedID] = true
+		out[r.BlockerID] = true
+	}
+	delete(out, user)
+	return out, nil
+}
+
+// ProfilesByIDs, PreferencesByIDs and IntentsByIDs load these per-user tables
+// for a whole set of candidates at once, so eligibility checks during matching
+// do not issue one query per candidate per table.
+func (s *Store) ProfilesByIDs(ctx context.Context, ids []string) (map[string]*Profile, error) {
+	out := make(map[string]*Profile, len(ids))
+	// Seed every key as nil: a user with no profile row must read as nil rather
+	// than be absent, or a caller doing map[id].Age dereferences nil.
+	for _, id := range ids {
+		out[id] = nil
+	}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	var rows []Profile
+	q, args, err := sqlxIn(`SELECT * FROM profiles WHERE user_id IN (?)`, ids)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.DB.SelectContext(ctx, &rows, q, args...); err != nil {
+		return nil, err
+	}
+	for i := range rows {
+		r := rows[i]
+		out[r.UserID] = &r
+	}
+	return out, nil
+}
+
+func (s *Store) PreferencesByIDs(ctx context.Context, ids []string) (map[string]*Preference, error) {
+	out := make(map[string]*Preference, len(ids))
+	for _, id := range ids {
+		out[id] = nil
+	}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	var rows []Preference
+	q, args, err := sqlxIn(`SELECT * FROM preferences WHERE user_id IN (?)`, ids)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.DB.SelectContext(ctx, &rows, q, args...); err != nil {
+		return nil, err
+	}
+	for i := range rows {
+		r := rows[i]
+		out[r.UserID] = &r
+	}
+	return out, nil
+}
+
+func (s *Store) IntentsByIDs(ctx context.Context, ids []string) (map[string][]string, error) {
+	out := make(map[string][]string, len(ids))
+	for _, id := range ids {
+		out[id] = []string{}
+	}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	var rows []struct {
+		UserID string `db:"user_id"`
+		Intent string `db:"intent"`
+	}
+	q, args, err := sqlxIn(`SELECT user_id, intent FROM user_intents WHERE user_id IN (?)`, ids)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.DB.SelectContext(ctx, &rows, q, args...); err != nil {
+		return nil, err
+	}
+	for _, r := range rows {
+		out[r.UserID] = append(out[r.UserID], r.Intent)
+	}
+	return out, nil
+}

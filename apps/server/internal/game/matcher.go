@@ -149,23 +149,54 @@ func (m *Matcher) tryMatch(ctx context.Context, entry *store.QueueEntry) (*store
 		return nil, err
 	}
 
+	// Load everything the eligibility rules need in a fixed number of queries.
+	// Doing this per candidate made one matching pass cost roughly 15 x 20
+	// statements, on the endpoint the PWA polls.
+	ids := make([]string, 0, len(entries))
+	for _, e := range entries {
+		ids = append(ids, e.UserID)
+	}
+	users, err := m.Store.UsersByIDs(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	blocked, err := m.Store.BlockedPairs(ctx, me.ID, ids)
+	if err != nil {
+		return nil, err
+	}
+	all := append([]string{me.ID}, ids...)
+	profiles, err := m.Store.ProfilesByIDs(ctx, all)
+	if err != nil {
+		return nil, err
+	}
+	prefs, err := m.Store.PreferencesByIDs(ctx, all)
+	if err != nil {
+		return nil, err
+	}
+	intents, err := m.Store.IntentsByIDs(ctx, all)
+	if err != nil {
+		return nil, err
+	}
+	el := &eligibility{
+		me:       eligibilityRow{intents: intents[me.ID], profile: profiles[me.ID], pref: prefs[me.ID]},
+		profiles: profiles,
+		prefs:    prefs,
+		intents:  intents,
+	}
+
 	var best []candidate
 	for _, other := range entries {
-		them, err := m.Store.GetUser(ctx, other.UserID)
-		if err != nil {
+		them, ok := users[other.UserID]
+		if !ok {
 			continue
 		}
 		if them.Incognito || them.Hidden || them.Status != "active" {
 			continue
 		}
-		blocked, err := m.Store.BlockedEitherWay(ctx, me.ID, them.ID)
-		if err != nil {
-			return nil, err
-		}
-		if blocked {
+		if blocked[them.ID] {
 			continue
 		}
-		if !m.mutuallyEligible(ctx, me, them) {
+		if !el.ok(them.ID) {
 			continue
 		}
 		best = append(best, candidate{entry: other, user: them})
@@ -190,32 +221,28 @@ func (m *Matcher) tryMatch(ctx context.Context, entry *store.QueueEntry) (*store
 	return &session, nil
 }
 
+// mutuallyEligible is kept for callers outside the batched matching path.
 func (m *Matcher) mutuallyEligible(ctx context.Context, me, them store.User) bool {
-	meIntents, _ := m.Store.IntentsFor(ctx, me.ID)
-	themIntents, _ := m.Store.IntentsFor(ctx, them.ID)
-	if !IntentsOK(meIntents, themIntents) {
+	ids := []string{me.ID, them.ID}
+	profiles, err := m.Store.ProfilesByIDs(ctx, ids)
+	if err != nil {
 		return false
 	}
-	meProfile, _ := m.Store.ProfileFor(ctx, me.ID)
-	themProfile, _ := m.Store.ProfileFor(ctx, them.ID)
-	mePref, _ := m.Store.PreferenceFor(ctx, me.ID)
-	themPref, _ := m.Store.PreferenceFor(ctx, them.ID)
-
-	var meAge, themAge *int
-	var meGender, themGender *string
-	if meProfile != nil {
-		meAge, meGender = meProfile.Age, meProfile.GenderID
-	}
-	if themProfile != nil {
-		themAge, themGender = themProfile.Age, themProfile.GenderID
-	}
-	if !AgeOK(meAge, mePref, themAge, themPref) {
+	prefs, err := m.Store.PreferencesByIDs(ctx, ids)
+	if err != nil {
 		return false
 	}
-	if !GenderOK(mePref, themGender) || !GenderOK(themPref, meGender) {
+	intents, err := m.Store.IntentsByIDs(ctx, ids)
+	if err != nil {
 		return false
 	}
-	return true
+	el := &eligibility{
+		me:       eligibilityRow{intents: intents[me.ID], profile: profiles[me.ID], pref: prefs[me.ID]},
+		profiles: profiles,
+		prefs:    prefs,
+		intents:  intents,
+	}
+	return el.ok(them.ID)
 }
 
 func (m *Matcher) startSession(ctx context.Context, kind, mode string, userIDs []string) (store.GameSession, error) {
@@ -228,4 +255,47 @@ func deref(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+// eligibilityRow and eligibility hold the per-user data the matching rules need,
+// loaded in bulk so the query count does not grow with the candidate count.
+type eligibilityRow struct {
+	intents []string
+	profile *store.Profile
+	pref    *store.Preference
+}
+
+type eligibility struct {
+	me       eligibilityRow
+	profiles map[string]*store.Profile
+	prefs    map[string]*store.Preference
+	intents  map[string][]string
+}
+
+// ok applies the matching rules for both directions.
+func (e *eligibility) ok(otherID string) bool {
+	them := eligibilityRow{
+		intents: e.intents[otherID],
+		profile: e.profiles[otherID],
+		pref:    e.prefs[otherID],
+	}
+	if !IntentsOK(e.me.intents, them.intents) {
+		return false
+	}
+
+	var meAge, themAge *int
+	var meGender, themGender *string
+	if e.me.profile != nil {
+		meAge, meGender = e.me.profile.Age, e.me.profile.GenderID
+	}
+	if them.profile != nil {
+		themAge, themGender = them.profile.Age, them.profile.GenderID
+	}
+	if !AgeOK(meAge, e.me.pref, themAge, them.pref) {
+		return false
+	}
+	if !GenderOK(e.me.pref, themGender) || !GenderOK(them.pref, meGender) {
+		return false
+	}
+	return true
 }
