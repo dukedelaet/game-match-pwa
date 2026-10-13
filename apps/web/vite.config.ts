@@ -8,7 +8,12 @@ export default defineConfig({
     tailwindcss(),
     react(),
     VitePWA({
-      registerType: 'autoUpdate',
+      // autoUpdate emitted skipWaiting() + clientsClaim(), so a deploy swapped
+      // the worker under a live game: open tabs claimed the new worker while
+      // still running the old JS, with no prompt. For a turn-based game with
+      // answers in flight that is a mid-round state mismatch, so the update is
+      // held until the user is told about it.
+      registerType: 'prompt',
       manifest: {
         name: 'GameMatch',
         short_name: 'GameMatch',
@@ -16,7 +21,15 @@ export default defineConfig({
         display: 'standalone',
         background_color: '#0b0614',
         theme_color: '#0b0614',
-        icons: [{ src: '/favicon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any' }],
+        // A single SVG with purpose 'any' is not enough to install reliably:
+        // Android wants 192 and 512 PNGs, maskable for adaptive icons, and iOS
+        // uses apple-touch-icon to avoid a screenshot on Add to Home Screen.
+        icons: [
+          { src: '/favicon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any' },
+          { src: '/icons/icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
+          { src: '/icons/icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
+          { src: '/icons/icon-maskable-512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
+        ],
       },
       workbox: {
         // Must be a precached build output. Workbox binds the fallback against

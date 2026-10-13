@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"gamematch/internal/store"
 )
 
 // Rate limits, from §Rate limits of the design doc.
@@ -79,7 +81,7 @@ func (s *Server) withinLimit(r *http.Request, bucket string, limit int, window t
 // turnstileOK decides whether a challenge is needed and, if so, whether the
 // supplied token passes. With no secret configured this always succeeds.
 func (s *Server) turnstileOK(r *http.Request, ip, token string) bool {
-	failures, err := s.Limiter.Count(r.Context(), "otp:fail:ip:"+ip, windowOTP)
+	failures, err := s.Limiter.Count(r.Context(), rlBucket("otp:fail:ip:", ip), windowOTP)
 	if err != nil {
 		failures = 0
 	}
@@ -92,7 +94,7 @@ func (s *Server) turnstileOK(r *http.Request, ip, token string) bool {
 		return false
 	}
 	if ok {
-		_ = s.Limiter.Reset(r.Context(), "otp:fail:ip:"+ip)
+		_ = s.Limiter.Reset(r.Context(), rlBucket("otp:fail:ip:", ip))
 	}
 	return ok
 }
@@ -117,4 +119,20 @@ const (
 	limitHidesPerReporter = 3
 	limitHidesPerSubject  = 1
 	windowHides           = 24 * time.Hour
+)
+
+// rlBucket builds a rate-limit bucket key from a prefix and an identifying
+// suffix. The suffix is digested rather than stored: the bucket column is the
+// table's primary key, so a raw phone number or IP would persist there forever
+// as a plaintext index of everyone who ever tried to sign in.
+func rlBucket(prefix, suffix string) string {
+	return prefix + store.BucketDigest(suffix)
+}
+
+// The queue status endpoint is polled by the PWA and drives a matching pass, so
+// it is the most expensive GET in the API. It previously had no limit at all,
+// which let one account hold the single-writer SQLite busy by polling it.
+const (
+	limitQueueStatusPerUser = 4
+	windowQueueStatus       = time.Second
 )

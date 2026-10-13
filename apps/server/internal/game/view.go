@@ -91,8 +91,9 @@ type SessionView struct {
 
 // View advances the session and returns its current state for a player.
 func (e *Engine) View(ctx context.Context, sessionID, userID string) (SessionView, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	mu := e.sessionLock(sessionID)
+	mu.Lock()
+	defer mu.Unlock()
 	if err := e.advanceLocked(ctx, sessionID); err != nil {
 		return SessionView{}, err
 	}

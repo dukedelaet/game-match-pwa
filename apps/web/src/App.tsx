@@ -13,6 +13,7 @@ import { api, ApiError, NetworkError, type Me } from './api'
 import { enablePush, pushResultMessage } from './push'
 import { useInstallPrompt } from './useInstallPrompt'
 import { startPolling } from './polling'
+import { DEMO_PHONE, DEMO_CODE, DEMO_HINT, SHOW_DEMO_OAUTH } from './demo'
 
 /**
  * Fetch the signed-in user, or bounce to sign in.
@@ -53,13 +54,14 @@ function Shell() {
   return (
     <div className="mx-auto min-h-dvh max-w-md text-[#f4e9ff]">
       <Outlet />
+      <UpdatePrompt />
     </div>
   )
 }
 
 function Welcome() {
   const nav = useNavigate()
-  const [phone, setPhone] = useState('+15551111111')
+  const [phone, setPhone] = useState(DEMO_PHONE)
   const [code, setCode] = useState('')
   const [step, setStep] = useState<'phone' | 'code'>('phone')
   const [err, setErr] = useState('')
@@ -96,30 +98,44 @@ function Welcome() {
           <button className="w-full rounded-2xl bg-fuchsia-500 py-3 font-bold text-white shadow-[0_0_24px_#d946ef]" onClick={start}>
             Create account / log in
           </button>
-          <button
-            className="w-full rounded-2xl bg-white py-3 font-bold text-black"
-            onClick={async () => {
-              const r = await api.post('/v1/auth/oauth/apple')
-              nav({ to: r.user.onboardingStep === 'done' ? '/home' : '/onboarding' })
-            }}
-          >
-            Continue with Apple
-          </button>
-          <button
-            className="w-full rounded-2xl bg-white/10 py-3 font-bold"
-            onClick={async () => {
-              const r = await api.post('/v1/auth/oauth/google')
-              nav({ to: r.user.onboardingStep === 'done' ? '/home' : '/onboarding' })
-            }}
-          >
-            Continue with Google
-          </button>
-          <p className="text-xs text-white/50">Demo: Alex +15551111111 · Jordan +15552222222 · code 123456. Apple/Google are local stand-ins until real keys are set.</p>
+          {/* These call an endpoint that only exists while APP_DEBUG is set, so
+              showing them in production offered two buttons that always failed. */}
+          {SHOW_DEMO_OAUTH && (
+            <>
+              <button
+                className="w-full rounded-2xl bg-white py-3 font-bold text-black"
+                onClick={async () => {
+                  try {
+                    const r = await api.post('/v1/auth/oauth/apple')
+                    nav({ to: r.user.onboardingStep === 'done' ? '/home' : '/onboarding' })
+                  } catch (e) {
+                    setErr(errorText(e, 'Sign-in failed.'))
+                  }
+                }}
+              >
+                Continue with Apple
+              </button>
+              <button
+                className="w-full rounded-2xl bg-white/10 py-3 font-bold"
+                onClick={async () => {
+                  try {
+                    const r = await api.post('/v1/auth/oauth/google')
+                    nav({ to: r.user.onboardingStep === 'done' ? '/home' : '/onboarding' })
+                  } catch (e) {
+                    setErr(errorText(e, 'Sign-in failed.'))
+                  }
+                }}
+              >
+                Continue with Google
+              </button>
+            </>
+          )}
+          {DEMO_HINT && <p className="text-xs text-white/50">{DEMO_HINT}</p>}
         </div>
       ) : (
         <div className="mt-10 space-y-3">
           <p className="text-sm text-fuchsia-200">{hint}</p>
-          <input className="w-full rounded-2xl bg-white/10 px-4 py-3 tracking-[0.4em]" value={code} onChange={(e) => setCode(e.target.value)} placeholder="123456" />
+          <input className="w-full rounded-2xl bg-white/10 px-4 py-3 tracking-[0.4em]" value={code} onChange={(e) => setCode(e.target.value)} placeholder={DEMO_CODE} />
           <button className="w-full rounded-2xl bg-fuchsia-500 py-3 font-bold" onClick={verify}>
             Continue
           </button>
@@ -1007,7 +1023,101 @@ function Boot() {
   return <p className="p-10">Loading…</p>
 }
 
-const rootRoute = createRootRoute({ component: Shell })
+// Without these, a render throw anywhere produced the router's raw error dump,
+// and a throw in Shell itself produced a white screen with no way back.
+/**
+ * registerType is 'prompt', so a new worker waits until the user accepts it.
+ * Without somewhere to offer that, updates would never apply and a user could
+ * be stuck on a stale build indefinitely.
+ */
+function UpdatePrompt() {
+  const [waiting, setWaiting] = useState(false)
+  useEffect(() => {
+    if (!('serviceWorker' in navigator)) return
+    let reg: ServiceWorkerRegistration | undefined
+    const track = (r: ServiceWorkerRegistration) => {
+      reg = r
+      if (r.waiting) setWaiting(true)
+      r.addEventListener('updatefound', () => {
+        const w = r.installing
+        w?.addEventListener('statechange', () => {
+          if (w.state === 'installed' && navigator.serviceWorker.controller) setWaiting(true)
+        })
+      })
+    }
+    void navigator.serviceWorker.getRegistration().then((r) => {
+      if (r) track(r)
+    })
+    let poll: ReturnType<typeof setInterval> | undefined
+    const startPolling = () => {
+      poll = setInterval(() => {
+        void navigator.serviceWorker.getRegistration().then((r) => {
+          if (r && !reg) track(r)
+          if (r?.waiting) setWaiting(true)
+        })
+      }, 60_000)
+    }
+    startPolling()
+    return () => {
+      if (poll) clearInterval(poll)
+    }
+  }, [])
+
+  if (!waiting) return null
+  return (
+    <div className="fixed inset-x-4 bottom-4 z-50 flex items-center justify-between gap-3 rounded-2xl bg-fuchsia-600 px-4 py-3 text-sm shadow-lg">
+      <span>A new version is ready.</span>
+      <button
+        className="rounded-full bg-white px-3 py-1 font-bold text-fuchsia-700"
+        onClick={() => {
+          reg_activate()
+        }}
+      >
+        Reload
+      </button>
+    </div>
+  )
+}
+
+// reg_activate tells the waiting worker to take over, then reloads.
+function reg_activate() {
+  if (!('serviceWorker' in navigator)) return
+  void navigator.serviceWorker.getRegistration().then((r) => {
+    r?.waiting?.postMessage({ type: 'SKIP_WAITING' })
+    window.location.reload()
+  })
+}
+
+const rootRoute = createRootRoute({
+  component: Shell,
+  errorComponent: RouteError,
+  notFoundComponent: RouteNotFound,
+})
+
+function RouteError({ error }: { error: unknown }) {
+  return (
+    <div className="space-y-4 p-8 text-center">
+      <p className="text-rose-300">{errorText(error, 'This screen could not be shown.')}</p>
+      <button
+        className="rounded-2xl bg-fuchsia-500 px-6 py-3 font-bold"
+        onClick={() => window.location.reload()}
+      >
+        Reload
+      </button>
+    </div>
+  )
+}
+
+function RouteNotFound() {
+  return (
+    <div className="space-y-4 p-8 text-center">
+      <p>That page does not exist.</p>
+      <Link to="/home" className="text-fuchsia-300 underline">
+        Back to home
+      </Link>
+    </div>
+  )
+}
 const indexRoute = createRoute({ getParentRoute: () => rootRoute, path: '/', component: Welcome })
 const bootRoute = createRoute({ getParentRoute: () => rootRoute, path: '/boot', component: Boot })
 const onRoute = createRoute({
@@ -1062,7 +1172,7 @@ const routeTree = rootRoute.addChildren([
   staffRoute,
   offlineRoute,
 ])
-const router = createRouter({ routeTree })
+const router = createRouter({ routeTree, defaultErrorComponent: RouteError, defaultNotFoundComponent: RouteNotFound })
 
 export default function App() {
   return <RouterProvider router={router} />

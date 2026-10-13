@@ -41,34 +41,71 @@ func (s *Server) idempotent(endpoint string, next http.HandlerFunc) http.Handler
 			Status      int    `db:"status"`
 			Response    string `db:"response"`
 		}
-		err = s.Store.DB.GetContext(r.Context(), &stored,
-			`SELECT request_hash, status, response FROM idempotency_keys WHERE user_id = ? AND key = ?`,
-			u.ID, key)
-		if err == nil {
-			if stored.RequestHash != hashHex {
+
+		// Claim the key first, then act. Checking for an existing row and only
+		// inserting afterwards left a window in which two concurrent requests
+		// with the same key both saw nothing and both ran the handler, so a
+		// double-tapped Connect made two matches and a retried message was sent
+		// twice. ON CONFLICT DO NOTHING could not help: it was already too late.
+		//
+		// status 0 marks a claim with no recorded response yet. A duplicate that
+		// arrives before the original finishes gets 409 rather than an empty
+		// replay, because there is nothing to replay.
+		res, err := s.Store.DB.ExecContext(r.Context(), `
+			INSERT INTO idempotency_keys (user_id, key, endpoint, request_hash, status, response, created_at)
+			VALUES (?,?,?,?,0,'',?)
+			ON CONFLICT(user_id, key) DO NOTHING`,
+			u.ID, key, endpoint, hashHex, store.NowTS())
+		if err != nil {
+			log.Printf("idempotency claim: %v", err)
+			// Fail open rather than dropping the request if the claim table is
+			// unavailable; the handler is still the source of truth.
+			rec := &captureWriter{header: http.Header{}}
+			next(rec, r)
+			rec.flush(w)
+			return
+		}
+		claimed, _ := res.RowsAffected()
+
+		if claimed == 0 {
+			// Someone else owns this key. Replay their recorded response, or tell
+			// the caller to retry if it is not ready yet.
+			err = s.Store.DB.GetContext(r.Context(), &stored,
+				`SELECT request_hash, status, response FROM idempotency_keys WHERE user_id = ? AND key = ?`,
+				u.ID, key)
+			if err == nil && stored.RequestHash != hashHex {
 				WriteError(w, http.StatusConflict, "idempotency_conflict",
 					"That idempotency key was used with a different request")
 				return
 			}
-			w.Header().Set("Content-Type", "application/json")
-			w.Header().Set("Idempotency-Replayed", "true")
-			w.WriteHeader(stored.Status)
-			_, _ = w.Write([]byte(stored.Response))
+			if err == nil && stored.Status >= 100 {
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Idempotency-Replayed", "true")
+				w.WriteHeader(stored.Status)
+				_, _ = w.Write([]byte(stored.Response))
+				return
+			}
+			WriteError(w, http.StatusConflict, "idempotency_in_progress",
+				"An identical request is still being processed")
 			return
 		}
 
 		rec := &captureWriter{header: http.Header{}}
 		next(rec, r)
 
-		// Only conclusive successes are remembered; a retry of a 4xx should be
-		// allowed to try again.
 		if rec.status >= 200 && rec.status < 300 {
 			if _, err := s.Store.DB.ExecContext(r.Context(), `
-				INSERT INTO idempotency_keys (user_id, key, endpoint, request_hash, status, response, created_at)
-				VALUES (?,?,?,?,?,?,?)
-				ON CONFLICT(user_id, key) DO NOTHING`,
-				u.ID, key, endpoint, hashHex, rec.status, rec.body.String(), store.NowTS()); err != nil {
+				UPDATE idempotency_keys SET status=?, response=?, created_at=?
+				WHERE user_id=? AND key=?`,
+				rec.status, rec.body.String(), store.NowTS(), u.ID, key); err != nil {
 				log.Printf("idempotency store: %v", err)
+			}
+		} else {
+			// Not a conclusive success: release the key so the caller may retry.
+			if _, err := s.Store.DB.ExecContext(r.Context(),
+				`DELETE FROM idempotency_keys WHERE user_id=? AND key=? AND status=0`,
+				u.ID, key); err != nil {
+				log.Printf("idempotency release: %v", err)
 			}
 		}
 		rec.flush(w)

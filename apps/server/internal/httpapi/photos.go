@@ -39,18 +39,19 @@ func (s *Server) uploadPhoto(w http.ResponseWriter, r *http.Request) {
 	}
 
 	id := uuid.NewString()
-	dir := filepath.Join(s.PhotosDir, u.ID)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := media.MkdirAll(filepath.Join(s.PhotosDir, u.ID)); err != nil {
 		WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
 		return
 	}
 	relFull := filepath.ToSlash(filepath.Join(u.ID, id+".jpg"))
 	relThumb := filepath.ToSlash(filepath.Join(u.ID, id+"_t.jpg"))
-	if err := os.WriteFile(filepath.Join(s.PhotosDir, relFull), full, 0o644); err != nil {
+	// Written through media.WriteFile so the restrictive mode is applied
+	// centrally and a reader can never see a partial image.
+	if err := media.WriteFile(filepath.Join(s.PhotosDir, relFull), full); err != nil {
 		WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
 		return
 	}
-	if err := os.WriteFile(filepath.Join(s.PhotosDir, relThumb), thumb, 0o644); err != nil {
+	if err := media.WriteFile(filepath.Join(s.PhotosDir, relThumb), thumb); err != nil {
 		WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
 		return
 	}

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"log"
 
 	"github.com/google/uuid"
 )
@@ -45,4 +46,14 @@ func (s *Store) PushSubscriptionsFor(ctx context.Context, userID string) ([]Push
 	out := []PushSubscription{}
 	err := s.DB.SelectContext(ctx, &out, `SELECT * FROM push_subscriptions WHERE user_id = ?`, userID)
 	return out, err
+}
+
+// PruneSubscription removes a push endpoint the push service reported as gone.
+// Without this, dead endpoints accumulated and every notification kept paying
+// for a doomed request.
+func (s *Store) PruneSubscription(ctx context.Context, endpoint string) {
+	if _, err := s.DB.ExecContext(ctx,
+		`DELETE FROM push_subscriptions WHERE endpoint = ?`, endpoint); err != nil {
+		log.Printf("push prune: %v", err)
+	}
 }

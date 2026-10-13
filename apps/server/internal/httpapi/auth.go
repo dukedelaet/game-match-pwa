@@ -67,7 +67,7 @@ func NewServer(st *store.Store, engine *game.Engine, matcher *game.Matcher, cfg 
 		Limiter:   ratelimit.New(st.DB),
 		SMS:       newSMS(cfg),
 		Turnstile: turnstile.New(cfg.TurnstileSecret),
-		Push:      push.New(cfg),
+		Push:      push.WithPruner(cfg, st),
 	}
 }
 
@@ -119,7 +119,7 @@ func (s *Server) otpStart(w http.ResponseWriter, r *http.Request) {
 
 	// OTP start always answers {ok:true} so it cannot be used to probe which
 	// phone numbers exist; limits are enforced silently.
-	if !s.withinLimit(r, "otp:start:ip:"+ip, limitOTPStartPerIP, windowOTP) {
+	if !s.withinLimit(r, rlBucket("otp:start:ip:", ip), limitOTPStartPerIP, windowOTP) {
 		WriteJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return
 	}
@@ -128,7 +128,7 @@ func (s *Server) otpStart(w http.ResponseWriter, r *http.Request) {
 		WriteJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return
 	}
-	if !s.withinLimit(r, "otp:start:phone:"+phone, limitOTPStartPerPhone, windowOTP) {
+	if !s.withinLimit(r, rlBucket("otp:start:phone:", phone), limitOTPStartPerPhone, windowOTP) {
 		WriteJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return
 	}
@@ -174,18 +174,18 @@ func (s *Server) otpVerify(w http.ResponseWriter, r *http.Request) {
 	phone := store.NormalizePhone(body.Phone)
 	ip := clientIP(r)
 
-	if !s.allow(w, r, "otp:verify:phone:"+phone, limitOTPVerifyPerPhone, windowOTP) {
+	if !s.allow(w, r, rlBucket("otp:verify:phone:", phone), limitOTPVerifyPerPhone, windowOTP) {
 		return
 	}
 
 	expected, ok := s.Store.TakeOTP(r.Context(), phone)
 	if !ok || body.Code != expected {
 		// Count failures per IP so a challenge can be demanded at OTP start.
-		s.Limiter.Bump(r.Context(), "otp:fail:ip:"+ip, windowOTP)
+		s.Limiter.Bump(r.Context(), rlBucket("otp:fail:ip:", ip), windowOTP)
 		WriteError(w, http.StatusUnauthorized, "invalid", "That code did not match")
 		return
 	}
-	_ = s.Limiter.Reset(r.Context(), "otp:fail:ip:"+ip)
+	_ = s.Limiter.Reset(r.Context(), rlBucket("otp:fail:ip:", ip))
 	hash := store.HashPhone(phone)
 	u, err := s.Store.UserByPhoneHash(r.Context(), hash)
 	if err != nil {

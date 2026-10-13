@@ -14,7 +14,7 @@ import (
 // this app relies on: WAL journaling, a 5s busy timeout, and foreign keys.
 func Open(path string) (*sqlx.DB, error) {
 	if dir := filepath.Dir(path); dir != "" {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
 			return nil, fmt.Errorf("create data dir: %w", err)
 		}
 	}
