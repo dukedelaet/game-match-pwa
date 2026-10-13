@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -303,4 +304,23 @@ func (s *Store) PhotoByID(ctx context.Context, id string) (Photo, error) {
 		return p, ErrNotFound
 	}
 	return p, err
+}
+
+// moderatedStatuses are account states set by safety tooling. A client action
+// must never move an account out of one of them.
+var moderatedStatuses = []string{"hidden", "deleted", "banned"}
+
+// ActivateIfNotModerated promotes a finished account to active, unless
+// moderation has placed it in a restricted state. Guarding here rather than in
+// the handler keeps the rule in one place for every caller.
+func (s *Store) ActivateIfNotModerated(ctx context.Context, userID string) error {
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(moderatedStatuses)), ",")
+	args := []any{userID}
+	for _, st := range moderatedStatuses {
+		args = append(args, st)
+	}
+	_, err := s.DB.ExecContext(ctx, `
+		UPDATE users SET status='active', updated_at=?
+		WHERE id=? AND status NOT IN (`+placeholders+`)`, append([]any{NowTS()}, args...)...)
+	return err
 }

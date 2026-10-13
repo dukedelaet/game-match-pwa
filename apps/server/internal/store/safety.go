@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/google/uuid"
 )
@@ -103,8 +104,48 @@ func (s *Store) InsertLegalHold(ctx context.Context, h *LegalHold) error {
 
 // AnonymizeUser applies the account-deletion mutation.
 func (s *Store) AnonymizeUser(ctx context.Context, userID string) error {
-	_, err := s.DB.ExecContext(ctx, `
-		UPDATE users SET status='deleted', name='Deleted', email=NULL, incognito=0, hidden=0, updated_at=? WHERE id=?`,
-		NowTS(), userID)
-	return err
+	// One transaction: a partial erasure would leave the account looking deleted
+	// while retaining the data the user asked us to remove.
+	tx, err := s.DB.BeginTxx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	now := NowTS()
+	// The cleartext phone row and its stable hash. The hash is UNIQUE, so
+	// keeping it would stop the number ever being used to register again.
+	for _, q := range []string{
+		`DELETE FROM user_private WHERE user_id = ?`,
+		`DELETE FROM photos WHERE user_id = ?`,
+		`DELETE FROM sessions WHERE user_id = ?`,
+		`DELETE FROM push_subscriptions WHERE user_id = ?`,
+		`DELETE FROM queue_entries WHERE user_id = ?`,
+		`DELETE FROM invites WHERE from_user_id = ? OR to_user_id = ?`,
+		`DELETE FROM blocks WHERE blocker_id = ? OR blocked_id = ?`,
+		`DELETE FROM messages WHERE sender_id = ?`,
+		`DELETE FROM round_answers WHERE user_id = ?`,
+		`DELETE FROM xp_events WHERE user_id = ?`,
+		`DELETE FROM signal_events WHERE user_id = ?`,
+		`DELETE FROM user_intents WHERE user_id = ?`,
+		`DELETE FROM user_traits WHERE user_id = ?`,
+		`DELETE FROM preferences WHERE user_id = ?`,
+		`DELETE FROM profiles WHERE user_id = ?`,
+		`DELETE FROM user_behavior_stats WHERE user_id = ?`,
+		`DELETE FROM idempotency_keys WHERE user_id = ?`,
+		`DELETE FROM session_participants WHERE user_id = ?`,
+	} {
+		if _, err := tx.ExecContext(ctx, q, userID, userID); err != nil {
+			return fmt.Errorf("erasing %q: %w", q, err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE users SET
+			status='deleted', name='Deleted', email=NULL, phone_e164_hash=NULL,
+			dob=NULL, approx_geohash=NULL, approx_geohash_source=NULL,
+			incognito=0, hidden=0, last_seen_at=NULL, updated_at=?
+		WHERE id=?`, now, userID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }

@@ -58,3 +58,56 @@ func TestProcessRejectsGIF(t *testing.T) {
 	_, _, err := Process(bytes.NewReader(gif), 1080)
 	require.ErrorIs(t, err, ErrBadImage)
 }
+
+// solidPNG encodes a single-colour image. Such an image compresses to almost
+// nothing while describing a bitmap large enough to exhaust memory, which is
+// the whole point of the attack: a few hundred KB on the wire, gigabytes once
+// decoded.
+func solidPNG(t *testing.T, w, h int) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for i := range img.Pix {
+		img.Pix[i] = 0x40
+	}
+	var buf bytes.Buffer
+	require.NoError(t, png.Encode(&buf, img))
+	return buf.Bytes()
+}
+
+func TestProcessRejectsDecompressionBomb(t *testing.T) {
+	payload := solidPNG(t, 12000, 12000)
+	require.Less(t, len(payload), 2<<20, "the payload must be small on the wire")
+
+	track := &peakReader{r: bytes.NewReader(payload)}
+
+	_, _, err := Process(track, 1080)
+	require.ErrorIs(t, err, ErrBadImage)
+	require.Less(t, track.peak, uint64(64<<20),
+		"a bomb must be rejected from its header, not after allocating the bitmap")
+}
+
+// A large but legitimate photo must still be downscaled, not rejected: the
+// ceiling guards memory, it does not cap upload resolution below maxEdge.
+func TestProcessAcceptsLargeButReasonableImage(t *testing.T) {
+	full, _, err := Process(bytes.NewReader(solidPNG(t, 4000, 3000)), 1080)
+	require.NoError(t, err)
+
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(full))
+	require.NoError(t, err)
+	require.Equal(t, 1080, cfg.Width)
+}
+
+// peakReader records how far into the payload the decoder actually read. A
+// header-only rejection reads almost none of it.
+type peakReader struct {
+	r    *bytes.Reader
+	peak uint64
+}
+
+func (p *peakReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	if uint64(n) > p.peak {
+		p.peak = uint64(n)
+	}
+	return n, err
+}

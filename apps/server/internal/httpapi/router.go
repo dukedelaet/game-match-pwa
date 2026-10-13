@@ -6,10 +6,35 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
+// maxJSONBody caps JSON request bodies. decodeJSON is otherwise unbounded, so
+// an endpoint that accepts a body will read however many bytes the client sends
+// and allocate them as Go strings -- one unauthenticated request to
+// /auth/otp/start with a multi-gigabyte phone field is enough to OOM the
+// process. Multipart photo upload replaces this cap with a larger one.
+const maxJSONBody = 64 << 10 // 64 KiB
+
+// LimitBody rejects request bodies larger than n with 413 before any handler
+// allocates them.
+func LimitBody(n int64) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.ContentLength > n {
+				WriteError(w, http.StatusRequestEntityTooLarge, "too_large", "That request is too large")
+				return
+			}
+			if r.Body != nil {
+				r.Body = http.MaxBytesReader(w, r.Body, n)
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 // Router builds the /v1 route table.
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
 	r.Use(Recover)
+	r.Use(LimitBody(maxJSONBody))
 	if s.Cfg.Env != "test" {
 		r.Use(LogRequests)
 	}
