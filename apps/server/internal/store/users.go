@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -303,4 +304,198 @@ func (s *Store) PhotoByID(ctx context.Context, id string) (Photo, error) {
 		return p, ErrNotFound
 	}
 	return p, err
+}
+
+// moderatedStatuses are account states set by safety tooling. A client action
+// must never move an account out of one of them.
+var moderatedStatuses = []string{"hidden", "deleted", "banned"}
+
+// ActivateIfNotModerated promotes a finished account to active, unless
+// moderation has placed it in a restricted state. Guarding here rather than in
+// the handler keeps the rule in one place for every caller.
+func (s *Store) ActivateIfNotModerated(ctx context.Context, userID string) error {
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(moderatedStatuses)), ",")
+	args := []any{userID}
+	for _, st := range moderatedStatuses {
+		args = append(args, st)
+	}
+	_, err := s.DB.ExecContext(ctx, `
+		UPDATE users SET status='active', updated_at=?
+		WHERE id=? AND status NOT IN (`+placeholders+`)`, append([]any{NowTS()}, args...)...)
+	return err
+}
+
+// UsersByIDs loads many users in one query. Matching used to call GetUser once
+// per candidate, which made the cost of a matching pass grow with the queue.
+func (s *Store) UsersByIDs(ctx context.Context, ids []string) (map[string]User, error) {
+	out := make(map[string]User, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	var rows []User
+	q, args, err := sqlxIn(`SELECT * FROM users WHERE id IN (?)`, ids)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.DB.SelectContext(ctx, &rows, q, args...); err != nil {
+		return nil, err
+	}
+	for _, u := range rows {
+		out[u.ID] = u
+	}
+	return out, nil
+}
+
+// BlockedPairs returns the subset of candidates blocked either way against user,
+// so the matching loop does not issue one query per pair.
+func (s *Store) BlockedPairs(ctx context.Context, user string, others []string) (map[string]bool, error) {
+	out := make(map[string]bool, len(others))
+	if len(others) == 0 {
+		return out, nil
+	}
+	var rows []struct {
+		BlockerID string `db:"blocker_id"`
+		BlockedID string `db:"blocked_id"`
+	}
+	ids := append([]string{user}, others...)
+	q, args, err := sqlxIn(
+		`SELECT blocker_id, blocked_id FROM blocks
+		 WHERE blocker_id IN (?) AND blocked_id IN (?)`, ids, ids)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.DB.SelectContext(ctx, &rows, q, args...); err != nil {
+		return nil, err
+	}
+	for _, r := range rows {
+		// Either direction blocks the pair.
+		out[r.BlockedID] = true
+		out[r.BlockerID] = true
+	}
+	delete(out, user)
+	return out, nil
+}
+
+// ProfilesByIDs, PreferencesByIDs and IntentsByIDs load these per-user tables
+// for a whole set of candidates at once, so eligibility checks during matching
+// do not issue one query per candidate per table.
+func (s *Store) ProfilesByIDs(ctx context.Context, ids []string) (map[string]*Profile, error) {
+	out := make(map[string]*Profile, len(ids))
+	// Seed every key as nil: a user with no profile row must read as nil rather
+	// than be absent, or a caller doing map[id].Age dereferences nil.
+	for _, id := range ids {
+		out[id] = nil
+	}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	var rows []Profile
+	q, args, err := sqlxIn(`SELECT * FROM profiles WHERE user_id IN (?)`, ids)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.DB.SelectContext(ctx, &rows, q, args...); err != nil {
+		return nil, err
+	}
+	for i := range rows {
+		r := rows[i]
+		out[r.UserID] = &r
+	}
+	return out, nil
+}
+
+func (s *Store) PreferencesByIDs(ctx context.Context, ids []string) (map[string]*Preference, error) {
+	out := make(map[string]*Preference, len(ids))
+	for _, id := range ids {
+		out[id] = nil
+	}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	var rows []Preference
+	q, args, err := sqlxIn(`SELECT * FROM preferences WHERE user_id IN (?)`, ids)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.DB.SelectContext(ctx, &rows, q, args...); err != nil {
+		return nil, err
+	}
+	for i := range rows {
+		r := rows[i]
+		out[r.UserID] = &r
+	}
+	return out, nil
+}
+
+func (s *Store) IntentsByIDs(ctx context.Context, ids []string) (map[string][]string, error) {
+	out := make(map[string][]string, len(ids))
+	for _, id := range ids {
+		out[id] = []string{}
+	}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	var rows []struct {
+		UserID string `db:"user_id"`
+		Intent string `db:"intent"`
+	}
+	q, args, err := sqlxIn(`SELECT user_id, intent FROM user_intents WHERE user_id IN (?)`, ids)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.DB.SelectContext(ctx, &rows, q, args...); err != nil {
+		return nil, err
+	}
+	for _, r := range rows {
+		out[r.UserID] = append(out[r.UserID], r.Intent)
+	}
+	return out, nil
+}
+
+// FirstOKPhotosFor returns the first approved photo for each user, in one
+// query. FirstOKPhoto issued one statement per user.
+func (s *Store) FirstOKPhotosFor(ctx context.Context, userIDs []string) (map[string]*Photo, error) {
+	out := make(map[string]*Photo, len(userIDs))
+	if len(userIDs) == 0 {
+		return out, nil
+	}
+	// Loaded in one statement and reduced in Go. photoLess must pick the same row
+	// FirstOKPhoto's ORDER BY created_at LIMIT 1 would, so the two are compared
+	// in TestFirstOKPhotosForMatchesFirstOKPhoto.
+	var rows []Photo
+	q, args, err := sqlxIn(`
+		SELECT * FROM photos WHERE user_id IN (?) AND moderation_state = 'ok'`, userIDs)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.DB.SelectContext(ctx, &rows, q, args...); err != nil {
+		return nil, err
+	}
+	for i := range rows {
+		p := rows[i]
+		existing, seen := out[p.UserID]
+		if !seen || photoLess(&p, existing) {
+			out[p.UserID] = &p
+		}
+	}
+	return out, nil
+}
+
+// photoLess breaks a created_at tie by id so the choice is deterministic. It is
+// stricter than FirstOKPhoto's ORDER BY, which leaves ties to SQLite; both are
+// correct for a single first photo, and any user with two photos sharing a
+// timestamp is vanishingly rare.
+func photoLess(a, b *Photo) bool {
+	av, bv := derefTS(a.CreatedAt), derefTS(b.CreatedAt)
+	if av != bv {
+		return av < bv
+	}
+	return a.ID < b.ID
+}
+
+func derefTS(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }

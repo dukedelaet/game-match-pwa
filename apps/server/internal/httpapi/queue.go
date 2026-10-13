@@ -35,6 +35,9 @@ func (s *Server) queueJoin(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) queueStatus(w http.ResponseWriter, r *http.Request) {
 	u := currentUser(r)
+	if !s.allow(w, r, rlBucket("queue:status:", u.ID), limitQueueStatusPerUser, windowQueueStatus) {
+		return
+	}
 	status, err := s.Matcher.Tick(r.Context(), u.ID)
 	if err != nil {
 		WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")

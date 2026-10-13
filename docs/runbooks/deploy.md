@@ -95,7 +95,11 @@ ship frontend changes — no service restart required.
 ## Operations
 
 - Logs: `journalctl -u gamematch -f`; Caddy in `/var/log/caddy/gamematch-access.log`.
-- Backups and restores: see `docs/runbooks/restore.md`.
-- Optional integrations (Twilio, Google/Apple OAuth, Turnstile, Web Push) are
-  configured through `/etc/gamematch/gamematch.env`; each degrades to a logged
-  no-op when its variables are absent.
+- Backups: `gamematch-backup.timer` runs `scripts/backup.sh` hourly into
+  `/backup/gamematch`, keeping 14 days. Check it is actually running:
+  `systemctl list-timers gamematch-backup.timer` and `journalctl -u gamematch-backup`.
+  Backups are local to the host; copy them off-box, or a disk failure takes the
+  history with it. Restores: see `docs/runbooks/restore.md`.
+- SMS delivery and Turnstile are **required** in production: the service refuses
+  to start without them rather than logging one-time codes to the journal. Web
+  Push (VAPID) stays optional; generate a pair with `gamematch vapid`.

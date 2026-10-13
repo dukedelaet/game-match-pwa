@@ -2,6 +2,10 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -103,8 +107,75 @@ func (s *Store) InsertLegalHold(ctx context.Context, h *LegalHold) error {
 
 // AnonymizeUser applies the account-deletion mutation.
 func (s *Store) AnonymizeUser(ctx context.Context, userID string) error {
-	_, err := s.DB.ExecContext(ctx, `
-		UPDATE users SET status='deleted', name='Deleted', email=NULL, incognito=0, hidden=0, updated_at=? WHERE id=?`,
-		NowTS(), userID)
+	// One transaction: a partial erasure would leave the account looking deleted
+	// while retaining the data the user asked us to remove.
+	tx, err := s.DB.BeginTxx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	now := NowTS()
+	// The cleartext phone row and its stable hash. The hash is UNIQUE, so
+	// keeping it would stop the number ever being used to register again.
+	for _, q := range []string{
+		`DELETE FROM user_private WHERE user_id = ?`,
+		`DELETE FROM photos WHERE user_id = ?`,
+		`DELETE FROM sessions WHERE user_id = ?`,
+		`DELETE FROM push_subscriptions WHERE user_id = ?`,
+		`DELETE FROM queue_entries WHERE user_id = ?`,
+		`DELETE FROM invites WHERE from_user_id = ? OR to_user_id = ?`,
+		`DELETE FROM blocks WHERE blocker_id = ? OR blocked_id = ?`,
+		`DELETE FROM messages WHERE sender_id = ?`,
+		`DELETE FROM round_answers WHERE user_id = ?`,
+		`DELETE FROM xp_events WHERE user_id = ?`,
+		`DELETE FROM signal_events WHERE user_id = ?`,
+		`DELETE FROM user_intents WHERE user_id = ?`,
+		`DELETE FROM user_traits WHERE user_id = ?`,
+		`DELETE FROM preferences WHERE user_id = ?`,
+		`DELETE FROM profiles WHERE user_id = ?`,
+		`DELETE FROM user_behavior_stats WHERE user_id = ?`,
+		`DELETE FROM idempotency_keys WHERE user_id = ?`,
+		`DELETE FROM session_participants WHERE user_id = ?`,
+	} {
+		if _, err := tx.ExecContext(ctx, q, userID, userID); err != nil {
+			return fmt.Errorf("erasing %q: %w", q, err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE users SET
+			status='deleted', name='Deleted', email=NULL, phone_e164_hash=NULL,
+			dob=NULL, approx_geohash=NULL, approx_geohash_source=NULL,
+			incognito=0, hidden=0, last_seen_at=NULL, updated_at=?
+		WHERE id=?`, now, userID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// bucketDigest converts a rate-limit bucket suffix (a phone number or an IP) into
+// a stable, non-reversible key. The limiter's bucket column is the table's
+// PRIMARY KEY, so storing the raw value made rate_limits a permanent plaintext
+// index of every phone number that ever requested a code.
+func BucketDigest(suffix string) string {
+	sum := sha256.Sum256([]byte(suffix))
+	return hex.EncodeToString(sum[:8])
+}
+
+// SweepRateLimits deletes rate-limit rows whose window started longer than
+// hours ago. Without it the table only ever grew, since nothing else removes
+// rows.
+func (s *Store) SweepRateLimits(ctx context.Context, hours int) error {
+	cutoff := time.Now().UTC().Add(-time.Duration(hours) * time.Hour).UnixMilli()
+	_, err := s.DB.ExecContext(ctx, `DELETE FROM rate_limits WHERE window_start < ?`, cutoff)
+	return err
+}
+
+// SweepIdempotencyKeys deletes stored idempotency keys older than hours. The
+// table had no expires_at and no delete path, so it grew without bound and a
+// key stayed permanently burned.
+func (s *Store) SweepIdempotencyKeys(ctx context.Context, hours int) error {
+	cutoff := FmtTS(time.Now().UTC().Add(-time.Duration(hours) * time.Hour))
+	_, err := s.DB.ExecContext(ctx, `DELETE FROM idempotency_keys WHERE created_at < ?`, cutoff)
 	return err
 }

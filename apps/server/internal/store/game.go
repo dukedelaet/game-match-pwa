@@ -159,11 +159,24 @@ func (s *Store) MarkJoined(ctx context.Context, sessionID, userID string) error 
 	return err
 }
 
-// TouchPoll bumps a participant's last poll time.
+// ErrNoParticipant reports that a user is not in a session. The UPDATE below
+// matches zero rows for a non-participant, so this turns a silent no-op into a
+// distinguishable failure.
+var ErrNoParticipant = errors.New("not a participant")
+
+// TouchPoll bumps a participant's last poll time. It fails with
+// ErrNoParticipant when the user is not in the session, so callers cannot
+// mistake an unauthorized poll for a successful heartbeat.
 func (s *Store) TouchPoll(ctx context.Context, sessionID, userID string) error {
-	_, err := s.DB.ExecContext(ctx, `UPDATE session_participants SET last_poll_at=? WHERE session_id=? AND user_id=?`,
+	res, err := s.DB.ExecContext(ctx, `UPDATE session_participants SET last_poll_at=? WHERE session_id=? AND user_id=?`,
 		NowTS(), sessionID, userID)
-	return err
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return ErrNoParticipant
+	}
+	return nil
 }
 
 // CountJoined counts participants that have joined.

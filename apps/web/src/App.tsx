@@ -9,17 +9,39 @@ import {
   useNavigate,
   redirect,
 } from '@tanstack/react-router'
-import { api, type Me } from './api'
+import { api, ApiError, NetworkError, type Me } from './api'
 import { enablePush, pushResultMessage } from './push'
 import { useInstallPrompt } from './useInstallPrompt'
+import { startPolling } from './polling'
+import { DEMO_PHONE, DEMO_CODE, DEMO_HINT, SHOW_DEMO_OAUTH } from './demo'
 
+/**
+ * Fetch the signed-in user, or bounce to sign in.
+ *
+ * Only a genuine 401 means "not signed in". A 500, a 429 or a dropped connection
+ * used to land in the same catch and log the user out of the UI, mid-game if it
+ * happened during a navigation, with no message and no retry.
+ */
 async function requireUser() {
   try {
     const { user } = await api.get('/v1/auth/session')
     return user as Me
-  } catch {
-    throw redirect({ to: '/' })
+  } catch (err) {
+    if (err instanceof ApiError && err.isUnauthorized) {
+      throw redirect({ to: '/' })
+    }
+    // Transient: keep the user where they are and surface a retry instead of
+    // pretending they signed out.
+    throw err
   }
+}
+
+/** Human-readable text for anything a request can reject with. */
+function errorText(err: unknown, fallback = 'Something went wrong'): string {
+  if (err instanceof ApiError) return err.message
+  if (err instanceof NetworkError) return 'Connection lost. Check your network and try again.'
+  if (err instanceof Error && err.message) return err.message
+  return fallback
 }
 
 function Shell() {
@@ -32,13 +54,14 @@ function Shell() {
   return (
     <div className="mx-auto min-h-dvh max-w-md text-[#f4e9ff]">
       <Outlet />
+      <UpdatePrompt />
     </div>
   )
 }
 
 function Welcome() {
   const nav = useNavigate()
-  const [phone, setPhone] = useState('+15551111111')
+  const [phone, setPhone] = useState(DEMO_PHONE)
   const [code, setCode] = useState('')
   const [step, setStep] = useState<'phone' | 'code'>('phone')
   const [err, setErr] = useState('')
@@ -75,30 +98,44 @@ function Welcome() {
           <button className="w-full rounded-2xl bg-fuchsia-500 py-3 font-bold text-white shadow-[0_0_24px_#d946ef]" onClick={start}>
             Create account / log in
           </button>
-          <button
-            className="w-full rounded-2xl bg-white py-3 font-bold text-black"
-            onClick={async () => {
-              const r = await api.post('/v1/auth/oauth/apple')
-              nav({ to: r.user.onboardingStep === 'done' ? '/home' : '/onboarding' })
-            }}
-          >
-            Continue with Apple
-          </button>
-          <button
-            className="w-full rounded-2xl bg-white/10 py-3 font-bold"
-            onClick={async () => {
-              const r = await api.post('/v1/auth/oauth/google')
-              nav({ to: r.user.onboardingStep === 'done' ? '/home' : '/onboarding' })
-            }}
-          >
-            Continue with Google
-          </button>
-          <p className="text-xs text-white/50">Demo: Alex +15551111111 · Jordan +15552222222 · code 123456. Apple/Google are local stand-ins until real keys are set.</p>
+          {/* These call an endpoint that only exists while APP_DEBUG is set, so
+              showing them in production offered two buttons that always failed. */}
+          {SHOW_DEMO_OAUTH && (
+            <>
+              <button
+                className="w-full rounded-2xl bg-white py-3 font-bold text-black"
+                onClick={async () => {
+                  try {
+                    const r = await api.post('/v1/auth/oauth/apple')
+                    nav({ to: r.user.onboardingStep === 'done' ? '/home' : '/onboarding' })
+                  } catch (e) {
+                    setErr(errorText(e, 'Sign-in failed.'))
+                  }
+                }}
+              >
+                Continue with Apple
+              </button>
+              <button
+                className="w-full rounded-2xl bg-white/10 py-3 font-bold"
+                onClick={async () => {
+                  try {
+                    const r = await api.post('/v1/auth/oauth/google')
+                    nav({ to: r.user.onboardingStep === 'done' ? '/home' : '/onboarding' })
+                  } catch (e) {
+                    setErr(errorText(e, 'Sign-in failed.'))
+                  }
+                }}
+              >
+                Continue with Google
+              </button>
+            </>
+          )}
+          {DEMO_HINT && <p className="text-xs text-white/50">{DEMO_HINT}</p>}
         </div>
       ) : (
         <div className="mt-10 space-y-3">
           <p className="text-sm text-fuchsia-200">{hint}</p>
-          <input className="w-full rounded-2xl bg-white/10 px-4 py-3 tracking-[0.4em]" value={code} onChange={(e) => setCode(e.target.value)} placeholder="123456" />
+          <input className="w-full rounded-2xl bg-white/10 px-4 py-3 tracking-[0.4em]" value={code} onChange={(e) => setCode(e.target.value)} placeholder={DEMO_CODE} />
           <button className="w-full rounded-2xl bg-fuchsia-500 py-3 font-bold" onClick={verify}>
             Continue
           </button>
@@ -124,10 +161,20 @@ function Onboarding() {
   const [err, setErr] = useState('')
 
   useEffect(() => {
-    api.get('/v1/catalogs').then((c) => {
-      setCats(c)
-      setMetro(c.metros[0]?.id)
-    })
+    let live = true
+    api
+      .get('/v1/catalogs')
+      .then((c) => {
+        if (!live) return
+        setCats(c)
+        setMetro(c.metros[0]?.id)
+      })
+      .catch((e) => {
+        if (live) setErr(errorText(e, 'Could not load the sign-up questions.'))
+      })
+    return () => {
+      live = false
+    }
   }, [])
 
   const toggle = (arr: string[], v: string, max: number) =>
@@ -154,7 +201,22 @@ function Onboarding() {
     nav({ to: '/home' })
   }
 
-  if (!cats) return <p className="p-8">Loading…</p>
+  if (!cats) {
+    // A failed load previously left this on "Loading…" forever.
+    return (
+      <div className="space-y-4 p-8">
+        <p className="text-rose-300">{err || 'Loading…'}</p>
+        {err && (
+          <button
+            className="rounded-2xl bg-fuchsia-500 px-6 py-3 font-bold"
+            onClick={() => window.location.reload()}
+          >
+            Try again
+          </button>
+        )}
+      </div>
+    )
+  }
   const screens = [
     <div key="i" className="space-y-4">
       <h2 className="text-2xl font-black">What brings you here?</h2>
@@ -322,27 +384,35 @@ function Play() {
 function Queue() {
   const nav = useNavigate()
   const [st, setSt] = useState<any>(null)
+  const [err, setErr] = useState('')
   useEffect(() => {
-    let stop = false
-    const tick = async () => {
-      const s = await api.get('/v1/queue/status')
-      if (stop) return
-      setSt(s)
-      if (s.state === 'matched') {
-        stop = true
-        await api.post(`/v1/sessions/${s.sessionId}/join`)
-        nav({ to: '/session/$id', params: { id: s.sessionId } })
-      }
-    }
-    tick()
-    const t = setInterval(tick, 2000)
-    return () => {
-      stop = true
-      clearInterval(t)
-    }
+    let joined = false
+    const stop = startPolling({
+      fetch: () => api.get('/v1/queue/status'),
+      onData: (s: any) => {
+        setSt(s)
+        if (s.state === 'matched' && !joined) {
+          joined = true
+          stop() // stop polling before the navigation, not after it
+          void api
+            .post(`/v1/sessions/${s.sessionId}/join`)
+            .then(() => nav({ to: '/session/$id', params: { id: s.sessionId } }))
+            .catch((e) => {
+              joined = false
+              setErr(errorText(e, 'Could not join the game.'))
+            })
+        }
+      },
+      intervalMs: 3000,
+    })
+    return stop
   }, [nav])
   return (
     <div className="flex min-h-dvh flex-col items-center justify-center px-6 text-center">
+      {err ? (
+        <p className="text-rose-300">{err}</p>
+      ) : (
+        <>
       <div className="h-16 w-16 animate-pulse rounded-full bg-fuchsia-500 shadow-[0_0_40px_#d946ef]" />
       <h1 className="mt-6 text-2xl font-black">You&apos;re in the queue</h1>
       <p className="mt-2 text-white/60">Waited {st?.waitedSec ?? 0}s</p>
@@ -359,6 +429,8 @@ function Queue() {
       <button className="mt-4 text-sm text-white/40" onClick={async () => { await api.del('/v1/queue'); nav({ to: '/home' }) }}>
         Leave
       </button>
+        </>
+      )}
     </div>
   )
 }
@@ -496,20 +568,29 @@ function RoundAnswers({ s, choose }: { s: any; choose: (payload: any) => void })
 function SessionPage({ id }: { id: string }) {
   const nav = useNavigate()
   const [s, setS] = useState<any>(null)
+  const [linkDown, setLinkDown] = useState(false)
   useEffect(() => {
-    let live = true
-    const poll = async () => {
-      const v = await api.get(`/v1/sessions/${id}`)
-      if (live) setS(v)
-    }
-    poll()
-    const t = setInterval(poll, 1000)
-    return () => {
-      live = false
-      clearInterval(t)
-    }
+    // Each poll doubles as the heartbeat: a 429 means the server stops counting
+    // us, and after 15s the forfeit backstop ends the game. So this must not
+    // outrun the limit, and must never overlap itself.
+    return startPolling({
+      fetch: () => api.get(`/v1/sessions/${id}`),
+      onData: (v: any) => {
+        setS(v)
+        setLinkDown(false)
+      },
+      onError: () => setLinkDown(true),
+      intervalMs: 3000,
+    })
   }, [id])
 
+  if (linkDown) {
+    return (
+      <div className="p-8 text-center">
+        <p className="text-rose-300">Connection lost — reconnecting…</p>
+      </div>
+    )
+  }
   if (!s) return <p className="p-8">Connecting…</p>
   if (s.state === 'pending' || s.state === 'countdown') {
     return (
@@ -689,10 +770,12 @@ function ChatThread({ id }: { id: string }) {
   const [threadMeta, setThreadMeta] = useState<any>(null)
   const load = () => api.get(`/v1/threads/${id}/messages`).then(setData)
   useEffect(() => {
-    load()
     api.get('/v1/threads').then((r) => setThreadMeta(r.items.find((x: any) => x.threadId === id)))
-    const t = setInterval(load, 2000)
-    return () => clearInterval(t)
+    return startPolling({
+      fetch: () => api.get(`/v1/threads/${id}/messages`),
+      onData: setData,
+      intervalMs: 3000,
+    })
   }, [id])
   const send = async (body: string) => {
     await api.post(`/v1/threads/${id}/messages`, { body })
@@ -940,7 +1023,101 @@ function Boot() {
   return <p className="p-10">Loading…</p>
 }
 
-const rootRoute = createRootRoute({ component: Shell })
+// Without these, a render throw anywhere produced the router's raw error dump,
+// and a throw in Shell itself produced a white screen with no way back.
+/**
+ * registerType is 'prompt', so a new worker waits until the user accepts it.
+ * Without somewhere to offer that, updates would never apply and a user could
+ * be stuck on a stale build indefinitely.
+ */
+function UpdatePrompt() {
+  const [waiting, setWaiting] = useState(false)
+  useEffect(() => {
+    if (!('serviceWorker' in navigator)) return
+    let reg: ServiceWorkerRegistration | undefined
+    const track = (r: ServiceWorkerRegistration) => {
+      reg = r
+      if (r.waiting) setWaiting(true)
+      r.addEventListener('updatefound', () => {
+        const w = r.installing
+        w?.addEventListener('statechange', () => {
+          if (w.state === 'installed' && navigator.serviceWorker.controller) setWaiting(true)
+        })
+      })
+    }
+    void navigator.serviceWorker.getRegistration().then((r) => {
+      if (r) track(r)
+    })
+    let poll: ReturnType<typeof setInterval> | undefined
+    const startPolling = () => {
+      poll = setInterval(() => {
+        void navigator.serviceWorker.getRegistration().then((r) => {
+          if (r && !reg) track(r)
+          if (r?.waiting) setWaiting(true)
+        })
+      }, 60_000)
+    }
+    startPolling()
+    return () => {
+      if (poll) clearInterval(poll)
+    }
+  }, [])
+
+  if (!waiting) return null
+  return (
+    <div className="fixed inset-x-4 bottom-4 z-50 flex items-center justify-between gap-3 rounded-2xl bg-fuchsia-600 px-4 py-3 text-sm shadow-lg">
+      <span>A new version is ready.</span>
+      <button
+        className="rounded-full bg-white px-3 py-1 font-bold text-fuchsia-700"
+        onClick={() => {
+          reg_activate()
+        }}
+      >
+        Reload
+      </button>
+    </div>
+  )
+}
+
+// reg_activate tells the waiting worker to take over, then reloads.
+function reg_activate() {
+  if (!('serviceWorker' in navigator)) return
+  void navigator.serviceWorker.getRegistration().then((r) => {
+    r?.waiting?.postMessage({ type: 'SKIP_WAITING' })
+    window.location.reload()
+  })
+}
+
+const rootRoute = createRootRoute({
+  component: Shell,
+  errorComponent: RouteError,
+  notFoundComponent: RouteNotFound,
+})
+
+function RouteError({ error }: { error: unknown }) {
+  return (
+    <div className="space-y-4 p-8 text-center">
+      <p className="text-rose-300">{errorText(error, 'This screen could not be shown.')}</p>
+      <button
+        className="rounded-2xl bg-fuchsia-500 px-6 py-3 font-bold"
+        onClick={() => window.location.reload()}
+      >
+        Reload
+      </button>
+    </div>
+  )
+}
+
+function RouteNotFound() {
+  return (
+    <div className="space-y-4 p-8 text-center">
+      <p>That page does not exist.</p>
+      <Link to="/home" className="text-fuchsia-300 underline">
+        Back to home
+      </Link>
+    </div>
+  )
+}
 const indexRoute = createRoute({ getParentRoute: () => rootRoute, path: '/', component: Welcome })
 const bootRoute = createRoute({ getParentRoute: () => rootRoute, path: '/boot', component: Boot })
 const onRoute = createRoute({
@@ -995,7 +1172,7 @@ const routeTree = rootRoute.addChildren([
   staffRoute,
   offlineRoute,
 ])
-const router = createRouter({ routeTree })
+const router = createRouter({ routeTree, defaultErrorComponent: RouteError, defaultNotFoundComponent: RouteNotFound })
 
 export default function App() {
   return <RouterProvider router={router} />

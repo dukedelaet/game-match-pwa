@@ -3,6 +3,7 @@ package httpapi
 import (
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math/big"
@@ -44,6 +45,17 @@ type Server struct {
 	DisableRateLimits bool
 }
 
+// newSMS resolves the SMS provider. A configuration that cannot deliver on live
+// traffic yields a provider that rejects every send rather than one that logs
+// one-time codes to the journal.
+func newSMS(cfg config.Config) sms.Provider {
+	p, err := sms.NewChecked(cfg)
+	if err != nil {
+		log.Printf("sms: %v", err)
+	}
+	return p
+}
+
 // NewServer builds a Server.
 func NewServer(st *store.Store, engine *game.Engine, matcher *game.Matcher, cfg config.Config) *Server {
 	return &Server{
@@ -53,9 +65,9 @@ func NewServer(st *store.Store, engine *game.Engine, matcher *game.Matcher, cfg 
 		Cfg:       cfg,
 		PhotosDir: cfg.PhotosDir(),
 		Limiter:   ratelimit.New(st.DB),
-		SMS:       sms.New(cfg),
+		SMS:       newSMS(cfg),
 		Turnstile: turnstile.New(cfg.TurnstileSecret),
-		Push:      push.New(cfg),
+		Push:      push.WithPruner(cfg, st),
 	}
 }
 
@@ -71,6 +83,14 @@ func decodeJSON(r *http.Request, v any) error {
 	return dec.Decode(v)
 }
 
+// errTooLarge reports whether err came from the body size limit, which surfaces
+// as a *http.MaxBytesError once the reader is pulled past the cap. Callers use
+// it to answer 413 instead of continuing with a zero-value struct.
+func errTooLarge(err error) bool {
+	var max *http.MaxBytesError
+	return errors.As(err, &max)
+}
+
 func randomCode() string {
 	n, err := rand.Int(rand.Reader, big.NewInt(1000000))
 	if err != nil {
@@ -84,7 +104,10 @@ func (s *Server) otpStart(w http.ResponseWriter, r *http.Request) {
 		Phone          string `json:"phone"`
 		TurnstileToken string `json:"turnstileToken"`
 	}
-	_ = decodeJSON(r, &body)
+	if err := decodeJSON(r, &body); errTooLarge(err) {
+		WriteError(w, http.StatusRequestEntityTooLarge, "too_large", "That request is too large")
+		return
+	}
 	ip := clientIP(r)
 
 	// A challenge is demanded only after repeated failures from one IP, and
@@ -96,7 +119,7 @@ func (s *Server) otpStart(w http.ResponseWriter, r *http.Request) {
 
 	// OTP start always answers {ok:true} so it cannot be used to probe which
 	// phone numbers exist; limits are enforced silently.
-	if !s.withinLimit(r, "otp:start:ip:"+ip, limitOTPStartPerIP, windowOTP) {
+	if !s.withinLimit(r, rlBucket("otp:start:ip:", ip), limitOTPStartPerIP, windowOTP) {
 		WriteJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return
 	}
@@ -105,7 +128,7 @@ func (s *Server) otpStart(w http.ResponseWriter, r *http.Request) {
 		WriteJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return
 	}
-	if !s.withinLimit(r, "otp:start:phone:"+phone, limitOTPStartPerPhone, windowOTP) {
+	if !s.withinLimit(r, rlBucket("otp:start:phone:", phone), limitOTPStartPerPhone, windowOTP) {
 		WriteJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return
 	}
@@ -151,18 +174,18 @@ func (s *Server) otpVerify(w http.ResponseWriter, r *http.Request) {
 	phone := store.NormalizePhone(body.Phone)
 	ip := clientIP(r)
 
-	if !s.allow(w, r, "otp:verify:phone:"+phone, limitOTPVerifyPerPhone, windowOTP) {
+	if !s.allow(w, r, rlBucket("otp:verify:phone:", phone), limitOTPVerifyPerPhone, windowOTP) {
 		return
 	}
 
 	expected, ok := s.Store.TakeOTP(r.Context(), phone)
 	if !ok || body.Code != expected {
 		// Count failures per IP so a challenge can be demanded at OTP start.
-		s.Limiter.Bump(r.Context(), "otp:fail:ip:"+ip, windowOTP)
+		s.Limiter.Bump(r.Context(), rlBucket("otp:fail:ip:", ip), windowOTP)
 		WriteError(w, http.StatusUnauthorized, "invalid", "That code did not match")
 		return
 	}
-	_ = s.Limiter.Reset(r.Context(), "otp:fail:ip:"+ip)
+	_ = s.Limiter.Reset(r.Context(), rlBucket("otp:fail:ip:", ip))
 	hash := store.HashPhone(phone)
 	u, err := s.Store.UserByPhoneHash(r.Context(), hash)
 	if err != nil {

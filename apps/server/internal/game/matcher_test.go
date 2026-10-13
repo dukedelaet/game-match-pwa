@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
 	"gamematch/internal/store"
@@ -169,4 +170,89 @@ func TestMatcherIgnoredWhenIncognito(t *testing.T) {
 	status, err := m.Tick(ctx, alex)
 	require.NoError(t, err)
 	require.Equal(t, "waiting", status.State, "incognito users are hidden from the lobby")
+}
+
+// The batched loaders must agree with the per-user versions they replaced. The
+// matching rules are only as trustworthy as these lookups.
+func TestBulkLoadersMatchThePerUserOnes(t *testing.T) {
+	_, st, _ := newEngineRig(t)
+	ctx := context.Background()
+
+	alex := userID(t, st, "Alex")
+	jordan := userID(t, st, "Jordan")
+	ids := []string{alex, jordan}
+
+	gotUsers, err := st.UsersByIDs(ctx, ids)
+	require.NoError(t, err)
+	for _, id := range ids {
+		want, err := st.GetUser(ctx, id)
+		require.NoError(t, err)
+		require.Equal(t, want.ID, gotUsers[id].ID, "user %s", id)
+	}
+
+	gotProfiles, err := st.ProfilesByIDs(ctx, ids)
+	require.NoError(t, err)
+	for _, id := range ids {
+		want, err := st.ProfileFor(ctx, id)
+		require.NoError(t, err)
+		if want == nil {
+			require.Nil(t, gotProfiles[id])
+			continue
+		}
+		require.NotNil(t, gotProfiles[id])
+		require.Equal(t, *want.Age, *gotProfiles[id].Age)
+	}
+
+	gotIntents, err := st.IntentsByIDs(ctx, ids)
+	require.NoError(t, err)
+	for _, id := range ids {
+		want, err := st.IntentsFor(ctx, id)
+		require.NoError(t, err)
+		require.ElementsMatch(t, want, gotIntents[id], "intents for %s", id)
+	}
+
+	gotPrefs, err := st.PreferencesByIDs(ctx, ids)
+	require.NoError(t, err)
+	for _, id := range ids {
+		want, err := st.PreferenceFor(ctx, id)
+		require.NoError(t, err)
+		if want == nil {
+			require.Nil(t, gotPrefs[id])
+			continue
+		}
+		require.NotNil(t, gotPrefs[id])
+		require.Equal(t, want.AgeMin, gotPrefs[id].AgeMin)
+	}
+}
+
+// A user with no profile or preferences must still appear in the bulk maps as
+// nil, not be missing, or the matching rules would dereference nil.
+func TestBulkLoadersIncludeUsersWithNoRows(t *testing.T) {
+	_, st, _ := newEngineRig(t)
+	ctx := context.Background()
+
+	stranger := loginNewUser(t, st)
+	ids := []string{stranger}
+
+	profiles, err := st.ProfilesByIDs(ctx, ids)
+	require.NoError(t, err)
+	pref, ok := profiles[stranger]
+	require.True(t, ok, "the key must exist even with no profile row")
+	require.Nil(t, pref)
+
+	intents, err := st.IntentsByIDs(ctx, ids)
+	require.NoError(t, err)
+	require.NotNil(t, intents[stranger])
+	require.Empty(t, intents[stranger])
+}
+
+// loginNewUser creates an account that has completed no profile at all.
+func loginNewUser(t *testing.T, st *store.Store) string {
+	t.Helper()
+	id := uuid.NewString()
+	now := store.NowTS()
+	_, err := st.DB.Exec(`INSERT INTO users (id, name, status, onboarding_step, created_at, updated_at)
+		VALUES (?, 'Nobody', 'active', 'intent', ?, ?)`, id, now, now)
+	require.NoError(t, err)
+	return id
 }

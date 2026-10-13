@@ -91,8 +91,9 @@ type SessionView struct {
 
 // View advances the session and returns its current state for a player.
 func (e *Engine) View(ctx context.Context, sessionID, userID string) (SessionView, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	mu := e.sessionLock(sessionID)
+	mu.Lock()
+	defer mu.Unlock()
 	if err := e.advanceLocked(ctx, sessionID); err != nil {
 		return SessionView{}, err
 	}
@@ -101,6 +102,12 @@ func (e *Engine) View(ctx context.Context, sessionID, userID string) (SessionVie
 
 // ViewNoAdvance builds the view without advancing (used after a locked call).
 func (e *Engine) buildView(ctx context.Context, sessionID, userID string) (SessionView, error) {
+	// Every path into a view goes through here, so this is where a non-player is
+	// stopped. Without it a caller defaults to seat 0 and is handed the other
+	// player's name, age, prompt and, at reveal time, their answers.
+	if err := e.requireParticipant(ctx, sessionID, userID); err != nil {
+		return SessionView{}, err
+	}
 	ses, err := e.Store.GetSession(ctx, sessionID)
 	if err != nil {
 		return SessionView{}, ErrNotFound

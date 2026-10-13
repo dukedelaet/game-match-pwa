@@ -8,39 +8,78 @@ import (
 )
 
 // matches lists the caller's current mutual matches with their pair and thread.
+//
+// This was 4 + 6N statements: a pass per row for the block check, the pair, the
+// thread and the other user's card, and no LIMIT. Everything the rows share is
+// now loaded in bulk and the result set is capped.
 func (s *Server) matches(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	u := currentUser(r)
-	rows, err := s.Store.MutualMatchesFor(ctx, u.ID)
+	limit := listLimit(r)
+
+	rows, err := s.Store.MutualMatchesForLimited(ctx, u.ID, limit)
 	if err != nil {
 		WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
 		return
 	}
+	items, err := s.matchItems(ctx, u.ID, rows)
+	if err != nil {
+		WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
+		return
+	}
+	WriteJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+// matchItems assembles the match list, loading each shared relation once for the
+// whole page rather than once per row.
+func (s *Server) matchItems(ctx context.Context, userID string, rows []store.Match) ([]map[string]any, error) {
 	items := []map[string]any{}
+	if len(rows) == 0 {
+		return items, nil
+	}
+
+	otherIDs := make([]string, 0, len(rows))
+	matchIDs := make([]string, 0, len(rows))
+	pairs := make([][2]string, 0, len(rows))
 	for _, m := range rows {
-		blocked, err := s.Store.BlockedEitherWay(ctx, m.UserA, m.UserB)
-		if err != nil {
-			WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
-			return
+		other := m.UserA
+		if userID == m.UserA {
+			other = m.UserB
 		}
-		if blocked {
+		otherIDs = append(otherIDs, other)
+		matchIDs = append(matchIDs, m.ID)
+		pairs = append(pairs, [2]string{m.UserA, m.UserB})
+	}
+
+	blocked, err := s.visibleTo(ctx, userID, otherIDs)
+	if err != nil {
+		return nil, err
+	}
+	cards, err := s.cardsFor(ctx, otherIDs)
+	if err != nil {
+		return nil, err
+	}
+	threads, err := s.Store.ThreadsForMatches(ctx, matchIDs)
+	if err != nil {
+		return nil, err
+	}
+	rel, err := s.Store.PairsForPeople(ctx, pairs)
+	if err != nil {
+		return nil, err
+	}
+
+	for i, m := range rows {
+		if blocked[otherIDs[i]] {
 			continue
 		}
 		var pairID, threadID *string
-		if pair, _ := s.Store.PairFor(ctx, m.UserA, m.UserB); pair != nil {
-			pairID = &pair.ID
+		if p := rel[store.PairKey(m.UserA, m.UserB)]; p != nil {
+			id := p.ID
+			pairID = &id
 		}
-		if thread, _ := s.Store.ThreadForMatch(ctx, m.ID); thread != nil {
-			threadID = &thread.ID
-		}
-		otherID := m.UserA
-		if u.ID == m.UserA {
-			otherID = m.UserB
-		}
-		card, err := s.card(ctx, otherID)
-		if err != nil {
-			WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
-			return
+		if th := threads[m.ID]; th != nil {
+			id := th.ID
+			threadID = &id
 		}
 		items = append(items, map[string]any{
 			"id":              m.ID,
@@ -50,10 +89,10 @@ func (s *Server) matches(w http.ResponseWriter, r *http.Request) {
 			"expiresAt":       m.ExpiresAt,
 			"pairId":          pairID,
 			"threadId":        threadID,
-			"other":           card,
+			"other":           cards[otherIDs[i]],
 		})
 	}
-	WriteJSON(w, http.StatusOK, map[string]any{"items": items})
+	return items, nil
 }
 
 // meBlocks lists the blocks the caller has placed.
