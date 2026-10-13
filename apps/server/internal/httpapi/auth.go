@@ -3,6 +3,7 @@ package httpapi
 import (
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math/big"
@@ -82,6 +83,14 @@ func decodeJSON(r *http.Request, v any) error {
 	return dec.Decode(v)
 }
 
+// errTooLarge reports whether err came from the body size limit, which surfaces
+// as a *http.MaxBytesError once the reader is pulled past the cap. Callers use
+// it to answer 413 instead of continuing with a zero-value struct.
+func errTooLarge(err error) bool {
+	var max *http.MaxBytesError
+	return errors.As(err, &max)
+}
+
 func randomCode() string {
 	n, err := rand.Int(rand.Reader, big.NewInt(1000000))
 	if err != nil {
@@ -95,7 +104,10 @@ func (s *Server) otpStart(w http.ResponseWriter, r *http.Request) {
 		Phone          string `json:"phone"`
 		TurnstileToken string `json:"turnstileToken"`
 	}
-	_ = decodeJSON(r, &body)
+	if err := decodeJSON(r, &body); errTooLarge(err) {
+		WriteError(w, http.StatusRequestEntityTooLarge, "too_large", "That request is too large")
+		return
+	}
 	ip := clientIP(r)
 
 	// A challenge is demanded only after repeated failures from one IP, and
