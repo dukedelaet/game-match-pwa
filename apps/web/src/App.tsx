@@ -12,6 +12,7 @@ import {
 import { api, ApiError, NetworkError, type Me } from './api'
 import { enablePush, pushResultMessage } from './push'
 import { useInstallPrompt } from './useInstallPrompt'
+import { startPolling } from './polling'
 
 /**
  * Fetch the signed-in user, or bounce to sign in.
@@ -367,27 +368,35 @@ function Play() {
 function Queue() {
   const nav = useNavigate()
   const [st, setSt] = useState<any>(null)
+  const [err, setErr] = useState('')
   useEffect(() => {
-    let stop = false
-    const tick = async () => {
-      const s = await api.get('/v1/queue/status')
-      if (stop) return
-      setSt(s)
-      if (s.state === 'matched') {
-        stop = true
-        await api.post(`/v1/sessions/${s.sessionId}/join`)
-        nav({ to: '/session/$id', params: { id: s.sessionId } })
-      }
-    }
-    tick()
-    const t = setInterval(tick, 2000)
-    return () => {
-      stop = true
-      clearInterval(t)
-    }
+    let joined = false
+    const stop = startPolling({
+      fetch: () => api.get('/v1/queue/status'),
+      onData: (s: any) => {
+        setSt(s)
+        if (s.state === 'matched' && !joined) {
+          joined = true
+          stop() // stop polling before the navigation, not after it
+          void api
+            .post(`/v1/sessions/${s.sessionId}/join`)
+            .then(() => nav({ to: '/session/$id', params: { id: s.sessionId } }))
+            .catch((e) => {
+              joined = false
+              setErr(errorText(e, 'Could not join the game.'))
+            })
+        }
+      },
+      intervalMs: 3000,
+    })
+    return stop
   }, [nav])
   return (
     <div className="flex min-h-dvh flex-col items-center justify-center px-6 text-center">
+      {err ? (
+        <p className="text-rose-300">{err}</p>
+      ) : (
+        <>
       <div className="h-16 w-16 animate-pulse rounded-full bg-fuchsia-500 shadow-[0_0_40px_#d946ef]" />
       <h1 className="mt-6 text-2xl font-black">You&apos;re in the queue</h1>
       <p className="mt-2 text-white/60">Waited {st?.waitedSec ?? 0}s</p>
@@ -404,6 +413,8 @@ function Queue() {
       <button className="mt-4 text-sm text-white/40" onClick={async () => { await api.del('/v1/queue'); nav({ to: '/home' }) }}>
         Leave
       </button>
+        </>
+      )}
     </div>
   )
 }
@@ -541,20 +552,29 @@ function RoundAnswers({ s, choose }: { s: any; choose: (payload: any) => void })
 function SessionPage({ id }: { id: string }) {
   const nav = useNavigate()
   const [s, setS] = useState<any>(null)
+  const [linkDown, setLinkDown] = useState(false)
   useEffect(() => {
-    let live = true
-    const poll = async () => {
-      const v = await api.get(`/v1/sessions/${id}`)
-      if (live) setS(v)
-    }
-    poll()
-    const t = setInterval(poll, 1000)
-    return () => {
-      live = false
-      clearInterval(t)
-    }
+    // Each poll doubles as the heartbeat: a 429 means the server stops counting
+    // us, and after 15s the forfeit backstop ends the game. So this must not
+    // outrun the limit, and must never overlap itself.
+    return startPolling({
+      fetch: () => api.get(`/v1/sessions/${id}`),
+      onData: (v: any) => {
+        setS(v)
+        setLinkDown(false)
+      },
+      onError: () => setLinkDown(true),
+      intervalMs: 3000,
+    })
   }, [id])
 
+  if (linkDown) {
+    return (
+      <div className="p-8 text-center">
+        <p className="text-rose-300">Connection lost — reconnecting…</p>
+      </div>
+    )
+  }
   if (!s) return <p className="p-8">Connecting…</p>
   if (s.state === 'pending' || s.state === 'countdown') {
     return (
@@ -734,10 +754,12 @@ function ChatThread({ id }: { id: string }) {
   const [threadMeta, setThreadMeta] = useState<any>(null)
   const load = () => api.get(`/v1/threads/${id}/messages`).then(setData)
   useEffect(() => {
-    load()
     api.get('/v1/threads').then((r) => setThreadMeta(r.items.find((x: any) => x.threadId === id)))
-    const t = setInterval(load, 2000)
-    return () => clearInterval(t)
+    return startPolling({
+      fetch: () => api.get(`/v1/threads/${id}/messages`),
+      onData: setData,
+      intervalMs: 3000,
+    })
   }, [id])
   const send = async (body: string) => {
     await api.post(`/v1/threads/${id}/messages`, { body })
