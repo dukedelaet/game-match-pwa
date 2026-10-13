@@ -13,12 +13,31 @@ import (
 	"gamematch/internal/store"
 )
 
+// sessionLock returns the mutex guarding one session, creating it on first use.
+//
+// State transitions used to share a single engine-wide mutex, so every poll for
+// every live session queued behind every other poll and behind completion,
+// which runs the scorer while holding the lock. Locking per session keeps the
+// same guarantee for a session's own transitions while letting unrelated
+// sessions proceed in parallel.
+//
+// Locks are never removed: sessions are UUIDs and the map is bounded by the
+// number of sessions the process has seen, which is the same order as the
+// sessions table itself.
+func (e *Engine) sessionLock(sessionID string) *sync.Mutex {
+	if v, ok := e.locks.Load(sessionID); ok {
+		return v.(*sync.Mutex)
+	}
+	v, _ := e.locks.LoadOrStore(sessionID, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
+
 // Engine drives game sessions. A single mutex serializes state transitions,
 // which is sufficient for this single-process prototype.
 type Engine struct {
 	Store *store.Store
 	Cfg   config.Config
-	mu    sync.Mutex
+	locks sync.Map // sessionID -> *sync.Mutex
 }
 
 // NewEngine builds an engine.
@@ -107,8 +126,9 @@ func (e *Engine) StartSession(ctx context.Context, kind, mode string, userIDs []
 
 // Join marks a participant present and starts the countdown when enough have joined.
 func (e *Engine) Join(ctx context.Context, sessionID, userID string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	mu := e.sessionLock(sessionID)
+	mu.Lock()
+	defer mu.Unlock()
 	ses, err := e.Store.GetSession(ctx, sessionID)
 	if err != nil {
 		return ErrNotFound
@@ -156,8 +176,9 @@ func (e *Engine) requireParticipant(ctx context.Context, sessionID, userID strin
 
 // Heartbeat records a poll and advances the session.
 func (e *Engine) Heartbeat(ctx context.Context, sessionID, userID string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	mu := e.sessionLock(sessionID)
+	mu.Lock()
+	defer mu.Unlock()
 	if err := e.requireParticipant(ctx, sessionID, userID); err != nil {
 		return err
 	}
@@ -170,8 +191,9 @@ func (e *Engine) Heartbeat(ctx context.Context, sessionID, userID string) error 
 // Leave forfeits an unfinished session. Only a participant may do it, since the
 // action ends the game for the other player too.
 func (e *Engine) Leave(ctx context.Context, sessionID, userID string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	mu := e.sessionLock(sessionID)
+	mu.Lock()
+	defer mu.Unlock()
 	if err := e.requireParticipant(ctx, sessionID, userID); err != nil {
 		return err
 	}
@@ -192,8 +214,9 @@ func (e *Engine) Leave(ctx context.Context, sessionID, userID string) error {
 
 // Answer records a player's answer and advances the session.
 func (e *Engine) Answer(ctx context.Context, sessionID, userID string, payload json.RawMessage) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	mu := e.sessionLock(sessionID)
+	mu.Lock()
+	defer mu.Unlock()
 	if err := e.requireParticipant(ctx, sessionID, userID); err != nil {
 		return err
 	}
@@ -256,8 +279,9 @@ func (e *Engine) Answer(ctx context.Context, sessionID, userID string, payload j
 
 // Advance runs the state machine for a session.
 func (e *Engine) Advance(ctx context.Context, sessionID string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	mu := e.sessionLock(sessionID)
+	mu.Lock()
+	defer mu.Unlock()
 	return e.advanceLocked(ctx, sessionID)
 }
 

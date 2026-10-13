@@ -9,11 +9,11 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/stretchr/testify/require"
 	"gamematch/internal/config"
 	"gamematch/internal/db"
 	"gamematch/internal/game"
 	"gamematch/internal/store"
+	"github.com/stretchr/testify/require"
 )
 
 // Directly counts how many times the wrapped handler runs for one key, with no
