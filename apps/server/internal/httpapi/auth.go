@@ -67,7 +67,7 @@ func NewServer(st *store.Store, engine *game.Engine, matcher *game.Matcher, cfg 
 		Limiter:   ratelimit.New(st.DB),
 		SMS:       newSMS(cfg),
 		Turnstile: turnstile.New(cfg.TurnstileSecret),
-		Push:      push.New(cfg),
+		Push:      push.WithPruner(cfg, st),
 	}
 }
 

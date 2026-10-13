@@ -572,6 +572,9 @@ func (e *Engine) tickOnce(ctx context.Context) {
 	if err := e.Store.SweepRateLimits(ctx, rateLimitRetentionHours); err != nil {
 		log.Printf("ticker: sweep rate limits: %v", err)
 	}
+	if err := e.Store.SweepIdempotencyKeys(ctx, idempotencyRetentionHours); err != nil {
+		log.Printf("ticker: sweep idempotency keys: %v", err)
+	}
 
 	ids, err := e.Store.ActiveSessionIDs(ctx)
 	if err != nil {
@@ -585,6 +588,9 @@ func (e *Engine) tickOnce(ctx context.Context) {
 	}
 }
 
-// rateLimitRetentionHours bounds how long a throttling counter is kept. Long
+// Retention windows for tables that would otherwise grow without bound. Long
 // enough to cover the longest window the API uses.
-const rateLimitRetentionHours = 24
+const (
+	rateLimitRetentionHours   = 24
+	idempotencyRetentionHours = 24
+)

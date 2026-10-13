@@ -170,3 +170,12 @@ func (s *Store) SweepRateLimits(ctx context.Context, hours int) error {
 	_, err := s.DB.ExecContext(ctx, `DELETE FROM rate_limits WHERE window_start < ?`, cutoff)
 	return err
 }
+
+// SweepIdempotencyKeys deletes stored idempotency keys older than hours. The
+// table had no expires_at and no delete path, so it grew without bound and a
+// key stayed permanently burned.
+func (s *Store) SweepIdempotencyKeys(ctx context.Context, hours int) error {
+	cutoff := FmtTS(time.Now().UTC().Add(-time.Duration(hours) * time.Hour))
+	_, err := s.DB.ExecContext(ctx, `DELETE FROM idempotency_keys WHERE created_at < ?`, cutoff)
+	return err
+}
