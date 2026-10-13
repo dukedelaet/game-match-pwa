@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 
 	"gamematch/internal/store"
 )
@@ -256,4 +257,61 @@ func (s *Server) inviteItem(ctx context.Context, inv store.Invite, viewerID stri
 		FromMe:    inv.FromUserID == viewerID,
 		Other:     card,
 	}, nil
+}
+
+// cardsFor builds the card for each userID in a fixed number of queries.
+//
+// card() issued three statements per user (user, profile, first photo), so a
+// list of N rows cost 3N on top of everything else the handler did. Collecting
+// the IDs first and loading each table once keeps a list response flat.
+func (s *Server) cardsFor(ctx context.Context, userIDs []string) (map[string]*Card, error) {
+	out := make(map[string]*Card, len(userIDs))
+	if len(userIDs) == 0 {
+		return out, nil
+	}
+
+	users, err := s.Store.UsersByIDs(ctx, userIDs)
+	if err != nil {
+		return nil, err
+	}
+	profiles, err := s.Store.ProfilesByIDs(ctx, userIDs)
+	if err != nil {
+		return nil, err
+	}
+	photos, err := s.Store.FirstOKPhotosFor(ctx, userIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, id := range userIDs {
+		u, ok := users[id]
+		if !ok {
+			continue
+		}
+		card := &Card{ID: u.ID, Name: u.Name}
+		if p := profiles[id]; p != nil {
+			card.Age = p.Age
+			card.Bio = p.Bio
+		}
+		if ph := photos[id]; ph != nil {
+			url := "/v1/photos/" + ph.ID
+			card.PhotoURL = &url
+		}
+		out[id] = card
+	}
+	return out, nil
+}
+
+// visibleTo filters out anyone blocked in either direction, in one query.
+func (s *Server) visibleTo(ctx context.Context, me string, others []string) (map[string]bool, error) {
+	blocked, err := s.Store.BlockedPairs(ctx, me, others)
+	if err != nil {
+		return nil, err
+	}
+	return blocked, nil
+}
+
+// listLimit reads and clamps the ?limit= query parameter.
+func listLimit(r *http.Request) int {
+	return store.ClampListLimit(r.URL.Query().Get("limit"))
 }

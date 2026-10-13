@@ -451,3 +451,51 @@ func (s *Store) IntentsByIDs(ctx context.Context, ids []string) (map[string][]st
 	}
 	return out, nil
 }
+
+// FirstOKPhotosFor returns the first approved photo for each user, in one
+// query. FirstOKPhoto issued one statement per user.
+func (s *Store) FirstOKPhotosFor(ctx context.Context, userIDs []string) (map[string]*Photo, error) {
+	out := make(map[string]*Photo, len(userIDs))
+	if len(userIDs) == 0 {
+		return out, nil
+	}
+	// Loaded in one statement and reduced in Go. photoLess must pick the same row
+	// FirstOKPhoto's ORDER BY created_at LIMIT 1 would, so the two are compared
+	// in TestFirstOKPhotosForMatchesFirstOKPhoto.
+	var rows []Photo
+	q, args, err := sqlxIn(`
+		SELECT * FROM photos WHERE user_id IN (?) AND moderation_state = 'ok'`, userIDs)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.DB.SelectContext(ctx, &rows, q, args...); err != nil {
+		return nil, err
+	}
+	for i := range rows {
+		p := rows[i]
+		existing, seen := out[p.UserID]
+		if !seen || photoLess(&p, existing) {
+			out[p.UserID] = &p
+		}
+	}
+	return out, nil
+}
+
+// photoLess breaks a created_at tie by id so the choice is deterministic. It is
+// stricter than FirstOKPhoto's ORDER BY, which leaves ties to SQLite; both are
+// correct for a single first photo, and any user with two photos sharing a
+// timestamp is vanishingly rare.
+func photoLess(a, b *Photo) bool {
+	av, bv := derefTS(a.CreatedAt), derefTS(b.CreatedAt)
+	if av != bv {
+		return av < bv
+	}
+	return a.ID < b.ID
+}
+
+func derefTS(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}

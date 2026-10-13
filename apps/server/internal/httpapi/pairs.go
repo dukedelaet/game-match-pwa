@@ -30,13 +30,6 @@ func (s *Server) pairViewFor(ctx context.Context, p store.Pair, viewerID string)
 	if blocked {
 		return nil, nil
 	}
-	your, their := p.AAction, p.BAction
-	if viewerID == p.UserB {
-		your, their = p.BAction, p.AAction
-	}
-	if p.State == "closed" && your != "pass" {
-		return nil, nil
-	}
 	otherID := p.UserA
 	if viewerID == p.UserA {
 		otherID = p.UserB
@@ -44,6 +37,19 @@ func (s *Server) pairViewFor(ctx context.Context, p store.Pair, viewerID string)
 	card, err := s.card(ctx, otherID)
 	if err != nil {
 		return nil, err
+	}
+	return s.pairViewWith(ctx, p, viewerID, card)
+}
+
+// pairViewWith builds a pair item from a card already loaded, so a list of
+// pairs does not fetch one card per row.
+func (s *Server) pairViewWith(_ context.Context, p store.Pair, viewerID string, card *Card) (*PairItem, error) {
+	your, their := p.AAction, p.BAction
+	if viewerID == p.UserB {
+		your, their = p.BAction, p.AAction
+	}
+	if p.State == "closed" && your != "pass" {
+		return nil, nil
 	}
 	if card == nil {
 		return nil, nil
@@ -58,17 +64,47 @@ func (s *Server) pairViewFor(ctx context.Context, p store.Pair, viewerID string)
 	}, nil
 }
 
+// pairs lists the caller's pair relationships with the other person's card.
+// This was 4 + 4N statements -- a pass per pair for the block check and the
+// card -- with no LIMIT.
 func (s *Server) pairs(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	u := currentUser(r)
-	rows, err := s.Store.PairsForUser(ctx, u.ID)
+	rows, err := s.Store.PairsForUserLimited(ctx, u.ID, listLimit(r))
 	if err != nil {
 		WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
 		return
 	}
 	items := []PairItem{}
+	if len(rows) == 0 {
+		WriteJSON(w, http.StatusOK, map[string]any{"items": items})
+		return
+	}
+
+	otherIDs := make([]string, 0, len(rows))
 	for _, p := range rows {
-		item, err := s.pairViewFor(ctx, p, u.ID)
+		other := p.UserA
+		if u.ID == p.UserA {
+			other = p.UserB
+		}
+		otherIDs = append(otherIDs, other)
+	}
+	blocked, err := s.visibleTo(ctx, u.ID, otherIDs)
+	if err != nil {
+		WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
+		return
+	}
+	cards, err := s.cardsFor(ctx, otherIDs)
+	if err != nil {
+		WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
+		return
+	}
+
+	for i, p := range rows {
+		if blocked[otherIDs[i]] {
+			continue
+		}
+		item, err := s.pairViewWith(ctx, p, u.ID, cards[otherIDs[i]])
 		if err != nil {
 			WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
 			return
