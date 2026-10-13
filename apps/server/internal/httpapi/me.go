@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -213,15 +214,26 @@ func (s *Server) deleteMe(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
 		return
 	}
-	for _, p := range photos {
-		_ = os.Remove(filepath.Join(s.PhotosDir, p.Path))
-		if p.ThumbPath != nil {
-			_ = os.Remove(filepath.Join(s.PhotosDir, *p.ThumbPath))
-		}
-	}
 	if err := s.Store.AnonymizeUser(ctx, u.ID); err != nil {
 		WriteError(w, http.StatusInternalServerError, "server", "Something went wrong")
 		return
+	}
+	// Files go after the database commit, so a failed write cannot leave an
+	// active account with no photos. An unlink failure is logged rather than
+	// swallowed: intimate images left on disk with no trace is the one outcome
+	// worth an operator seeing.
+	for _, p := range photos {
+		if err := os.Remove(filepath.Join(s.PhotosDir, p.Path)); err != nil && !os.IsNotExist(err) {
+			log.Printf("delete account: remove %s: %v", p.Path, err)
+		}
+		if p.ThumbPath != nil {
+			if err := os.Remove(filepath.Join(s.PhotosDir, *p.ThumbPath)); err != nil && !os.IsNotExist(err) {
+				log.Printf("delete account: remove %s: %v", *p.ThumbPath, err)
+			}
+		}
+	}
+	if err := os.RemoveAll(filepath.Join(s.PhotosDir, u.ID)); err != nil && !os.IsNotExist(err) {
+		log.Printf("delete account: remove photo dir for %s: %v", u.ID, err)
 	}
 	if token := sessionToken(r); token != "" {
 		_ = s.Store.DeleteSession(ctx, token)
