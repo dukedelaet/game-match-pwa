@@ -2,7 +2,10 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -148,4 +151,22 @@ func (s *Store) AnonymizeUser(ctx context.Context, userID string) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// bucketDigest converts a rate-limit bucket suffix (a phone number or an IP) into
+// a stable, non-reversible key. The limiter's bucket column is the table's
+// PRIMARY KEY, so storing the raw value made rate_limits a permanent plaintext
+// index of every phone number that ever requested a code.
+func BucketDigest(suffix string) string {
+	sum := sha256.Sum256([]byte(suffix))
+	return hex.EncodeToString(sum[:8])
+}
+
+// SweepRateLimits deletes rate-limit rows whose window started longer than
+// hours ago. Without it the table only ever grew, since nothing else removes
+// rows.
+func (s *Store) SweepRateLimits(ctx context.Context, hours int) error {
+	cutoff := time.Now().UTC().Add(-time.Duration(hours) * time.Hour).UnixMilli()
+	_, err := s.DB.ExecContext(ctx, `DELETE FROM rate_limits WHERE window_start < ?`, cutoff)
+	return err
 }

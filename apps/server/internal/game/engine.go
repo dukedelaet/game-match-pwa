@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -544,15 +546,45 @@ func (e *Engine) RunTicker(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			_ = e.Store.ExpireStaleInvites(ctx)
-			_ = e.Store.ExpireStaleMatches(ctx)
-			ids, err := e.Store.ActiveSessionIDs(ctx)
-			if err != nil {
-				continue
-			}
-			for _, id := range ids {
-				_ = e.Advance(ctx, id)
-			}
+			e.tickOnce(ctx)
 		}
 	}
 }
+
+// tickOnce performs a single sweep. It recovers from panics because it runs on
+// a bare goroutine outside any HTTP handler: a panic here takes the whole
+// process down and with it every live game session. Errors are logged rather
+// than discarded, so a database that has started failing is visible instead of
+// silently disabling forfeit and expiry.
+func (e *Engine) tickOnce(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("ticker: recovered from panic: %v\n%s", r, debug.Stack())
+		}
+	}()
+
+	if err := e.Store.ExpireStaleInvites(ctx); err != nil {
+		log.Printf("ticker: expire invites: %v", err)
+	}
+	if err := e.Store.ExpireStaleMatches(ctx); err != nil {
+		log.Printf("ticker: expire matches: %v", err)
+	}
+	if err := e.Store.SweepRateLimits(ctx, rateLimitRetentionHours); err != nil {
+		log.Printf("ticker: sweep rate limits: %v", err)
+	}
+
+	ids, err := e.Store.ActiveSessionIDs(ctx)
+	if err != nil {
+		log.Printf("ticker: active sessions: %v", err)
+		return
+	}
+	for _, id := range ids {
+		if err := e.Advance(ctx, id); err != nil {
+			log.Printf("ticker: advance %s: %v", id, err)
+		}
+	}
+}
+
+// rateLimitRetentionHours bounds how long a throttling counter is kept. Long
+// enough to cover the longest window the API uses.
+const rateLimitRetentionHours = 24
