@@ -1,0 +1,44 @@
+# One ignore file for both images, because both are built from the repository
+# root:
+#
+#   docker build -t gamematch-api:latest -f apps/server/Dockerfile .
+#   docker build -t gamematch-web:latest -f apps/web/Dockerfile .
+#
+# This is not a substitute for narrow COPY paths — both Dockerfiles copy only
+# what they need — but it is the difference between a context of a few hundred
+# kilobytes and one carrying .git, node_modules and the demo database.
+
+# Version control: ~9 MB here and never useful inside an image.
+.git
+.gitignore
+.github
+
+# Dependencies. The Go module cache is rebuilt by `go mod download` inside the
+# build stage; Node and pnpm enter neither image.
+node_modules
+**/node_modules
+
+# Local state: the demo database, its WAL sidecars and uploads, and the
+# backup directory the compose stack writes to.
+apps/server/data
+data
+backups
+.caddytest
+
+# Secrets. Nothing here is read at build time, and a Dockerfile that needed one
+# would be wrong.
+.env
+.env.*
+
+# Noise.
+*.log
+
+# Not in any image, and large.
+docs
+.superpowers
+.claude
+.crush
+
+# apps/web/dist is deliberately NOT excluded: it is the web image's only build
+# input, and excluding it makes `docker build -f apps/web/Dockerfile .` fail with
+# "not found". It is 624 KB of content-hashed assets.

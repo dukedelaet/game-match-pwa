@@ -1,5 +1,18 @@
+# Secrets. .env.* was missing until #97 flagged it: `.env.production` was
+# committable. The one exception is the checked-in template compose reads.
 .env
 .env.backup
+.env.*
+!.env.example
+
+# Local state. The compose stack bind-mounts ./data (SQLite plus uploads) and
+# writes ./backups; both are host state, never repository content.
+/data/
+/backups/
+
+# Scratch directory deploy/caddy-verify.sh writes its fixtures into.
+/.caddytest/
+
 node_modules
 /apps/web/node_modules
 /apps/web/dist
