@@ -1,0 +1,70 @@
+# GameMatch — the whole stack: API, PWA behind Caddy, and (from Task 4) the
+# scheduled backup.
+#
+#   docker compose up --build
+#   docker compose run --rm api seed     # first run only; creates demo users
+#
+# Configuration is read from .env (gitignored, copy .env.example). One file
+# serves both hosts: the local machine and the VPS differ only in the values.
+
+name: gamematch
+
+services:
+  # The API is reachable only from this compose network.
+  #
+  # It binds 0.0.0.0 because a container's loopback is its own: Caddy runs in a
+  # different container and could never reach 127.0.0.1:8000 there. The
+  # exposure that creates is contained by never publishing the port. A
+  # `ports:` key here would serve the API unencrypted straight off the host's
+  # internet-facing interface — past TLS and past every security header in the
+  # Caddyfile, to anyone who can reach the VPS.
+  #
+  # Do not add ADDR here or to .env. The image sets ENV ADDR=0.0.0.0:8000;
+  # compose `environment:` overrides it, but a stray ADDR= in .env would bind
+  # loopback and every proxied call would 502 with no other symptom.
+  api:
+    image: gamematch-api:latest
+    # Both keys: the image name lets `docker compose up` reuse an image Task 2
+    # already built, and the build section lets `--build` rebuild it. The
+    # context is the repository root, so the two images share one .dockerignore.
+    build:
+      context: .
+      dockerfile: apps/server/Dockerfile
+    env_file:
+      - .env
+    volumes:
+      # DATA_DIR=/data comes from the image. The API runs as UID 10001, so
+      # ./data must be owned by that UID on the host before the first up:
+      #   mkdir -p data backups && sudo chown -R 10001:10001 data
+      - ./data:/data
+    restart: unless-stopped
+    # The server drains for 25s (shutdownGrace in cmd/gamematch/main.go) and
+    # Docker's default is 10s, which would SIGKILL in-flight requests on every
+    # deploy.
+    stop_grace_period: 30s
+
+  # The only service that is exposed. Caddy terminates TLS and serves the PWA;
+  # /v1 is reverse-proxied to the api service.
+  web:
+    image: gamematch-web:latest
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    environment:
+      # deploy/Caddyfile defaults this to 127.0.0.1:8000, which is correct on a
+      # host running the systemd units. Compose points it at the sibling
+      # container instead.
+      GAMEMATCH_API: api:8000
+      # The domain TLS is issued for. localhost serves HTTPS with Caddy's
+      # internal CA — there is no plain-HTTP mode, so both ports are published.
+      GAMEMATCH_SITE: ${GAMEMATCH_SITE:-localhost}
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    depends_on:
+      api:
+        # The API image declares a HEALTHCHECK with --start-interval=2s, so this
+        # costs about two seconds rather than a full 30s interval. web's own
+        # /v1 answers 502 until then; every static asset is already servable.
+        condition: service_healthy
+    restart: unless-stopped

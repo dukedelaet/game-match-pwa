@@ -12,6 +12,11 @@
 #
 # GAMEMATCH_LOG_DIR is where the access log is written; it must be writable by
 # the caddy user.
+#
+# GAMEMATCH_API is the API's address. The default is correct on a host, where
+# the service listens on loopback. In compose the API is a sibling container
+# and its loopback is not reachable from here, so compose sets
+# GAMEMATCH_API=api:8000.
 {
 	admin off
 }
@@ -21,7 +26,7 @@
 
 	# The API owns everything under /v1.
 	handle /v1/* {
-		reverse_proxy 127.0.0.1:8000
+		reverse_proxy {$GAMEMATCH_API:127.0.0.1:8000}
 	}
 
 	# Everything else is the built PWA.
