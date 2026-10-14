@@ -127,7 +127,7 @@ func (c Config) Validate() error {
 		missing = append(missing, "DEV_OTP (must be unset; it replaces the random OTP with a constant)")
 	}
 	if c.SMSProvider != "twilio" {
-		missing = append(missing, "SMS_PROVIDER (must be \"twilio\"; \"log\" writes OTPs to the journal in cleartext)")
+		missing = append(missing, "SMS_PROVIDER (must be \"twilio\"; \"log\" discards one-time codes instead of sending them, so nobody can sign in)")
 	}
 	for _, v := range []struct{ name, val string }{
 		{"TWILIO_ACCOUNT_SID", c.TwilioAccountID},
