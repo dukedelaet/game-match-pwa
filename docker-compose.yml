@@ -61,6 +61,25 @@ services:
     ports:
       - "${HTTP_PORT:-80}:80"
       - "${HTTPS_PORT:-443}:443"
+    volumes:
+      # Caddy's own storage. NOT the app's data — the api service bind-mounts
+      # the host's ./data to /data, and this is an unrelated path in a
+      # different container that merely shares the name.
+      #   caddy-data   XDG_DATA_HOME: the ACME account and every certificate
+      #   caddy-config XDG_CONFIG_HOME: the autosaved config
+      # The image declares no VOLUME for either (verified: `docker image
+      # inspect caddy:2.10.2-alpine --format '{{json .Config.Volumes}}'` is
+      # null), so without these they sit on the container's writable layer and
+      # `docker compose down` destroys them. The next `up` re-runs ACME, and
+      # Let's Encrypt permits 5 duplicate certificates per week per registered
+      # domain — enough to lock the domain out for the rest of the week.
+      - caddy-data:/data
+      - caddy-config:/config
+      # The access log. Caddy creates this directory itself if it is missing,
+      # but the roll_size 100MiB / roll_keep 10 / roll_keep_for 720h policy in
+      # deploy/Caddyfile bounds nothing that disappears with the container, and
+      # this is the only forensic trail a production deployment leaves.
+      - caddy-logs:/var/log/caddy
     depends_on:
       api:
         # The API image declares a HEALTHCHECK with --start-interval=2s, so this
@@ -68,3 +87,15 @@ services:
         # /v1 answers 502 until then; every static asset is already servable.
         condition: service_healthy
     restart: unless-stopped
+    # Caddy drains in-flight TLS connections when it is sent SIGTERM. Docker's
+    # 10s default leaves no headroom, so a request open at deploy time is cut
+    # rather than finished. 30s matches the api service.
+    stop_grace_period: 30s
+
+# Named, not anonymous: only `docker compose down -v` removes these, and the
+# runbook must not use it — the app's ./data is a bind mount and survives that
+# anyway, but the certificates above would not.
+volumes:
+  caddy-data:
+  caddy-config:
+  caddy-logs:
