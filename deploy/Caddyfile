@@ -1,12 +1,16 @@
 # GameMatch — Caddy configuration
 #
 # Set GAMEMATCH_SITE to your domain (e.g. gamematch.example.com) and Caddy will
-# obtain a certificate automatically. Leave it unset to serve plain HTTP on :80
-# for local use, or set it to `localhost` for Caddy's internal TLS.
+# obtain a certificate automatically. The default, `localhost`, serves HTTPS on
+# :443 with Caddy's internal CA — there is no plain-HTTP mode.
 #
-# Set GAMEMATCH_ROOT to the built PWA directory if it is not `apps/web/dist`
-# relative to the Caddy working directory.
-
+# GAMEMATCH_ROOT must be an absolute path to the built PWA. A relative one
+# resolves against Caddy's working directory — /srv in the container image, /
+# under the packaged systemd unit — and then every static asset 404s while
+# /v1/healthz still answers 200. The default is the path the image builds to.
+#
+# GAMEMATCH_LOG_DIR is where the access log is written; it must be writable by
+# the caddy user.
 {
 	admin off
 }
@@ -21,24 +25,40 @@
 
 	# Everything else is the built PWA.
 	handle {
-		root * {$GAMEMATCH_ROOT:apps/web/dist}
+		root * {$GAMEMATCH_ROOT:/srv/dist}
 		try_files {path} /index.html
 		file_server
 
-		# Content-hashed assets can be cached hard; the shell must revalidate.
+		# try_files serves the shell for *every* path it cannot match on disk, not
+		# for the four the previous @shell allowlist named. /boot, the PWA's own
+		# start_url, was therefore served with no Cache-Control at all, and a
+		# returning user could hold a stale index.html. So the rule is stated as
+		# the complement of the immutable one: the two matchers are disjoint, so
+		# every response gets exactly one Cache-Control whichever Caddy orders
+		# them in. (Setting the default unconditionally does not work — Caddy
+		# emits matched header ops first, so it would clobber the asset value.)
 		@assets path /assets/*
 		header @assets Cache-Control "public, max-age=31536000, immutable"
-		@shell path / /index.html /sw.js /registerSW.js /manifest.webmanifest
+		@shell not path /assets/*
 		header @shell Cache-Control "no-cache"
 	}
 
 	header {
-		X-Content-Type-Options nosniff
-		Referrer-Policy strict-origin-when-cross-origin
-		-X-Powered-By
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), geolocation=(), microphone=(), payment=(), usb=()"
+		# The PWA is same-origin only: no inline scripts or styles, no CDN
+		# assets, and every /v1 call is a relative fetch.
+		Content-Security-Policy "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; img-src 'self' data:; font-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; worker-src 'self'; manifest-src 'self'; form-action 'self'"
 	}
 
 	log {
-		output file /var/log/caddy/gamematch-access.log
+		output file {$GAMEMATCH_LOG_DIR:/var/log/caddy}/gamematch-access.log {
+			roll_size 100MiB
+			roll_keep 10
+			roll_keep_for 720h
+		}
 	}
 }
