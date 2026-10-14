@@ -574,11 +574,21 @@ Local runs use `APP_ENV=local`, so nothing so far exercises `Config.Validate()`.
 ```bash
 cp .env .env.local.bak
 sed -i 's/^APP_ENV=.*/APP_ENV=production/; s/^APP_DEBUG=.*/APP_DEBUG=false/' .env
+sed -i '/^DEV_OTP=/d' .env
 printf 'SMS_PROVIDER=twilio\nTWILIO_ACCOUNT_SID=ACplaceholder\nTWILIO_AUTH_TOKEN=placeholder\nTWILIO_FROM=+15550000000\nTURNSTILE_SECRET=0xplaceholder\n' >> .env
 docker compose up -d api
 sleep 5
 docker compose ps api
 ```
+
+The `sed -i '/^DEV_OTP=/d'` is **required**. `.env.example`'s local block ships
+`DEV_OTP=123456` uncommented, and `Config.Validate()` rejects any non-empty
+`DevOTP` in production (`internal/config/config.go:126-128`) — so without that
+line the container crash-loops with
+`config: unsafe production configuration: DEV_OTP`. `DevOTP` is populated with
+`getenv("DEV_OTP", ...)`, which only falls back to the default when the variable
+is *absent or empty*, so a leftover line is fatal rather than ignored. Found in
+Task 6.
 
 Expected: `api` is **running**, not restarting. It cannot deliver a real OTP against placeholder credentials — that is expected and is why Task 5 covers signing in. This step proves `Validate()` passes and the process starts.
 

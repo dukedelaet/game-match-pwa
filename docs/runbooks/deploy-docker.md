@@ -895,7 +895,8 @@ $ curl -sk -X POST https://localhost/v1/auth/otp/start -d '{"phone":"+1555123000
 
 No `devCode`. **That response alone does not prove `APP_DEBUG` is off.** The
 handler has four distinct paths that each answer `{"ok":true}` silently
-(`auth.go:120-146`, see §7(c2) above): the IP rate limit, a malformed phone, the
+(`auth.go:120-146`, see "(c2) otp/start fails silently once the rate limit is
+hit" under Step 7 above): the IP rate limit, a malformed phone, the
 phone rate limit, and public-signup being off with the number un-allowlisted.
 Only the fifth path — a code actually issued — omits `devCode` *because* debug is
 off, and only it writes an OTP row.
@@ -906,6 +907,12 @@ So the discriminator is `otp_codes`:
 $ sqlite3 data/gamematch.db "SELECT phone, code, code = '123456' AS is_dev_otp FROM otp_codes;"
 +15551230000|518585|0
 ```
+
+One caveat on that row: `PutOTP` upserts on phone conflict
+(`store/auth.go:61`), so a row left by an *earlier* request would be refreshed
+rather than created — and a row that was already sitting there would look like
+proof when nothing had run. Either confirm the table was empty beforehand, or
+check the row's `created_at` against the time of the call.
 
 A row exists, so the request ran the whole way through. `is_dev_otp = 0`: the
 stored code is random (`randomCode()`, `auth.go:149`), not the constant. Neither
@@ -989,9 +996,25 @@ Restarting (1) 6 seconds ago
 
 An operator who runs `docker compose ps` once during a deploy and sees
 `Up 1 second (health: starting)` concludes the service is starting normally. It
-is crashing roughly three times a second. **Use `docker inspect --format
-'{{.State.ExitCode}}'`, or read the log — do not trust a single `ps` line here.**
-The log naming the variable is the check that cannot be misread.
+is crashing roughly three times a second. **Read the log — that is the check
+that cannot be misread.**
+
+Do **not** reach for `.State.ExitCode` instead. It resets to `0` every time the
+container restarts, so during a crash loop it reads `0` once per cycle, in the
+brief window between the restart and `Validate()` killing the process again.
+Measured here: 7 of the first 50 samples were `0`. That is a worse misread than
+`ps`, because `0` looks like a definitive clean result rather than an ambiguous
+status — and on a healthy boot `ExitCode` is `0` too, so the two cases are
+indistinguishable.
+
+`RestartCount` is monotonic and strictly non-decreasing, so it has neither
+hazard:
+
+```bash
+docker inspect --format '{{.RestartCount}}' gamematch-api-1
+```
+
+Any non-zero value after a deploy means the API is not staying up.
 
 What the front end does while this is happening:
 
