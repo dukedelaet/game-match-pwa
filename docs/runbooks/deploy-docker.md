@@ -1,7 +1,8 @@
 # Docker deployment
 
-> **Status: partial.** This file currently holds only the *verified on local
-> Docker* evidence recorded by the deployment plan's Task 5. The full runbook —
+> **Status: partial.** This file currently holds verification evidence recorded by
+> the deployment plan — Task 5's *verified on local Docker* walkthrough and
+> Task 6's *verified: production boot path* — and nothing else. The full runbook —
 > the local test flow, the VPS deploy procedure, and the troubleshooting table —
 > is Task 7 and is not written yet. Until it is, `deploy.md` is still the only
 > complete deploy procedure in this repo, and it is the systemd path.
@@ -756,3 +757,307 @@ docker compose restart web
 A `web` restart drops in-flight TLS connections; the service sets
 `stop_grace_period: 30s` so Caddy drains first, but a client mid-request at that
 moment is cut rather than finished.
+
+---
+
+## Verified: production boot path
+
+Recorded on a local machine on 2026-10-14, immediately after the section above,
+against the same stack. Every local run so far has used `APP_ENV=local`, and
+`Config.Validate()` returns `nil` immediately outside production
+(`apps/server/internal/config/config.go:119-121`) — so **nothing above this line
+exercises it at all.** This section is the only evidence in the repo that the
+production guard works through a container.
+
+Same house standard as the section above: real terminal output, no altered
+values. Trims are declared inline. The credentials below are **placeholders** —
+`ACplaceholder` / `placeholder` / `+15550000000` / `0xplaceholder`. Nothing real
+is in `.env` or in this document.
+
+The plan's step 1 **does not pass as written**; the first block is the failure and
+the diagnosis, because an operator following the plan hits exactly this.
+
+### Step 1 — boot in production mode with placeholder credentials
+
+```bash
+cp .env .env.local.bak
+sed -i 's/^APP_ENV=.*/APP_ENV=production/; s/^APP_DEBUG=.*/APP_DEBUG=false/' .env
+printf 'SMS_PROVIDER=twilio\nTWILIO_ACCOUNT_SID=ACplaceholder\nTWILIO_AUTH_TOKEN=placeholder\nTWILIO_FROM=+15550000000\nTURNSTILE_SECRET=0xplaceholder\n' >> .env
+docker compose up -d api
+sleep 5
+docker compose ps api
+```
+
+```
+ Container gamematch-api-1 Recreate 
+ Container gamematch-api-1 Recreated 
+ Container gamematch-api-1 Starting 
+ Container gamematch-api-1 Started 
+NAME              IMAGE                  COMMAND                  SERVICE   CREATED          STATUS                         PORTS
+gamematch-api-1   gamematch-api:latest   "/usr/local/bin/game…"   api       12 seconds ago   Restarting (1) 2 seconds ago   
+```
+
+```
+$ docker compose logs api | tail -20
+api-1  | 2026/10/14 22:14:41 config: unsafe production configuration: DEV_OTP (must be unset; it replaces the random OTP with a constant)
+api-1  | 2026/10/14 22:14:44 config: unsafe production configuration: DEV_OTP (must be unset; it replaces the random OTP with a constant)
+api-1  | 2026/10/14 22:14:47 config: unsafe production configuration: DEV_OTP (must be unset; it replaces the random OTP with a constant)
+api-1  | 2026/10/14 22:14:51 config: unsafe production configuration: DEV_OTP (must be unset; it replaces the random OTP with a constant)
+
+$ docker inspect gamematch-api-1 --format "RestartCount={{.RestartCount}} ExitCode={{.State.ExitCode}} Status={{.State.Status}}"
+RestartCount=4 ExitCode=1 Status=restarting
+```
+
+**Why: the `sed` leaves `DEV_OTP` set.** `.env.example`'s local block ships it
+**uncommented** — `DEV_OTP=123456`, line 32 — and the step rewrites only
+`APP_ENV` and `APP_DEBUG`. `DevOTP` is `getenv("DEV_OTP", devOTPDefault(env))`
+(`config.go:86`), and `devOTPDefault` only supplies the default when the variable
+is *absent*, so the literal `123456` from the local block wins. `Validate()` then
+refuses it (`config.go:126-128`). One extra line fixes it:
+
+```bash
+sed -i '/^DEV_OTP=/d' .env
+```
+
+This is the same trap the VPS block warns about twice in its prose ("DEV_OTP is
+the one line in this block that stays commented"), reached by a different route.
+The file is correct; the step's `sed` is not. **Note the direction of the
+failure, though: the refusal is loud, names the variable, and kills the process.
+That is the property being verified, and it held here too.**
+
+With `DEV_OTP` removed — a complete production environment, still placeholder
+credentials — the step passes:
+
+```
+ Container gamematch-api-1 Recreate 
+ Container gamematch-api-1 Recreated 
+ Container gamematch-api-1 Starting 
+ Container gamematch-api-1 Started 
+NAME              IMAGE                  COMMAND                  SERVICE   CREATED          STATUS                   PORTS
+gamematch-api-1   gamematch-api:latest   "/usr/local/bin/game…"   api       15 seconds ago   Up 5 seconds (healthy)   8000/tcp
+```
+
+**Running, not restarting.** The boot line and the environment actually in the
+container:
+
+```
+$ docker compose logs api | tail -5
+api-1  | 2026/10/14 22:15:08 gamematch listening on http://0.0.0.0:8000 (data dir /data, debug=false)
+api-1  | 2026/10/14 22:15:10 GET /v1/healthz 200 0s
+
+$ docker compose exec api env | grep -E "^(APP_ENV|APP_DEBUG|DEV_OTP|SMS_PROVIDER|TURNSTILE_SECRET|TWILIO_ACCOUNT_SID)=" | sort
+APP_DEBUG=false
+APP_ENV=production
+SMS_PROVIDER=twilio
+TURNSTILE_SECRET=0xplaceholder
+TWILIO_ACCOUNT_SID=ACplaceholder
+```
+
+`DEV_OTP` is in that grep's pattern and does not appear in the output: the
+variable is absent from the container's environment entirely, because the
+`sed -i '/^DEV_OTP=/d' .env` removed it from the file `env_file` reads. That is
+what `Validate()` requires — not "set to empty", which `getenv` would also treat
+as unset but which leaves a confusing line in the file.
+
+### Step 2 — the API port is still closed in production mode
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' --max-time 3 http://127.0.0.1:8000/v1/healthz
+```
+
+```
+$ curl -s -o /dev/null -w '%{http_code}\n' --max-time 3 http://127.0.0.1:8000/v1/healthz
+000
+
+$ docker compose ps --format "{{.Service}} {{.Ports}}"
+api 8000/tcp
+backup 
+web 0.0.0.0:80->80/tcp, [::]:80->80/tcp, 0.0.0.0:443->443/tcp, [::]:443->443/tcp, 443/udp, 2019/tcp
+
+$ docker compose exec web wget -qO- http://api:8000/v1/healthz
+{"ok":true}
+```
+
+`000`, and still no `->` on the `api` line. Containment is a property of the
+compose file, not of the environment, and `APP_ENV=production` does not change
+it. The in-network `wget` is there so `000` is not mistaken for a dead API.
+
+### Step 3 — `APP_DEBUG` is genuinely off
+
+```bash
+curl -sk -X POST https://localhost/v1/auth/otp/start -d '{"phone":"+15551230000"}'
+```
+
+```
+$ curl -sk -X POST https://localhost/v1/auth/otp/start -d '{"phone":"+15551230000"}'
+{"ok":true}
+```
+
+No `devCode`. **That response alone does not prove `APP_DEBUG` is off.** The
+handler has four distinct paths that each answer `{"ok":true}` silently
+(`auth.go:120-146`, see §7(c2) above): the IP rate limit, a malformed phone, the
+phone rate limit, and public-signup being off with the number un-allowlisted.
+Only the fifth path — a code actually issued — omits `devCode` *because* debug is
+off, and only it writes an OTP row.
+
+So the discriminator is `otp_codes`:
+
+```
+$ sqlite3 data/gamematch.db "SELECT phone, code, code = '123456' AS is_dev_otp FROM otp_codes;"
++15551230000|518585|0
+```
+
+A row exists, so the request ran the whole way through. `is_dev_otp = 0`: the
+stored code is random (`randomCode()`, `auth.go:149`), not the constant. Neither
+limit was reached and public signup was on, which rules the other four out
+directly:
+
+```
+$ sqlite3 data/gamematch.db "SELECT bucket, count, window_start FROM rate_limits WHERE bucket LIKE 'otp:start%';"
+otp:start:ip:4be83b3115428950|1|1792016120559
+otp:start:phone:86d40e3443117dc4|1|1792016120647
+
+$ sqlite3 data/gamematch.db "SELECT key, value FROM feature_flags;"
+auth.public_signup|{"v":true}
+auth.otp|{"v":true}
+games.enabled|{"v":true}
+staff.force_pair|{"v":true}
+```
+
+Counts of 1 against limits of 5/IP and 3/phone, and `auth.public_signup` is true.
+
+The Twilio send was genuinely attempted and genuinely failed, which is the point
+of placeholder credentials — the failure is logged, and the request still
+answers 200:
+
+```
+$ docker compose logs api | grep -v healthz | tail -8
+api-1  | 2026/10/14 22:15:08 gamematch listening on http://0.0.0.0:8000 (data dir /data, debug=false)
+api-1  | 2026/10/14 22:15:20 sms send: twilio: status 401: Authentication Error - invalid username
+api-1  | 2026/10/14 22:15:20 POST /v1/auth/otp/start 200 309ms
+```
+
+`auth.otp` is `{"v":true}` here, so this is a real send, not a skipped one. That
+flag is the incident kill switch (`auth.go:156`); it is defaulted by migration
+`0008_default_flags.sql:8`, which exists precisely because `seed` writes only
+`auth.public_signup` (`seed.go:143`). Expect this line on a VPS with a wrong
+`TWILIO_ACCOUNT_SID`.
+
+### Step 4 — a missing variable still fails the boot
+
+This is the Review Focus item: *if the entrypoint swallowed the exit code, a VPS
+would deploy a silently non-functional service.*
+
+```bash
+sed -i '/^TURNSTILE_SECRET=/d' .env
+docker compose up -d --force-recreate api
+sleep 5
+docker compose logs api | tail -20
+docker compose ps api
+```
+
+```
+$ docker compose logs api | tail -20
+api-1  | 2026/10/14 22:15:34 config: unsafe production configuration: TURNSTILE_SECRET (required in production)
+api-1  | 2026/10/14 22:15:37 config: unsafe production configuration: TURNSTILE_SECRET (required in production)
+api-1  | 2026/10/14 22:15:39 config: unsafe production configuration: TURNSTILE_SECRET (required in production)
+api-1  | 2026/10/14 22:15:42 config: unsafe production configuration: TURNSTILE_SECRET (required in production)
+```
+
+The exit code survives the container boundary:
+
+```
+$ docker inspect gamematch-api-1 --format "Status={{.State.Status}} ExitCode={{.State.ExitCode}} RestartCount={{.RestartCount}} Error={{.State.Error}}"
+Status=restarting ExitCode=1 RestartCount=8 Error=
+```
+
+**`docker compose ps api` does not reliably show this, and that is the one sharp
+edge in this section.** `restart: unless-stopped` on the `api` service
+(`docker-compose.yml:40`) means the container never comes to rest in `Exited
+(1)` — it crash-loops, so a single `ps` sample lands at an arbitrary point in the
+cycle and alternates between two readings, both of which look benign:
+
+```
+$ for i in 1 2 3 4 5 6; do docker compose ps api --format '{{.Status}}'; sleep 2; done
+Up 1 second (health: starting)
+Up 1 second (health: starting)
+Restarting (1) 3 seconds ago
+Restarting (1) 2 seconds ago
+Restarting (1) 4 seconds ago
+Restarting (1) 6 seconds ago
+```
+
+An operator who runs `docker compose ps` once during a deploy and sees
+`Up 1 second (health: starting)` concludes the service is starting normally. It
+is crashing roughly three times a second. **Use `docker inspect --format
+'{{.State.ExitCode}}'`, or read the log — do not trust a single `ps` line here.**
+The log naming the variable is the check that cannot be misread.
+
+What the front end does while this is happening:
+
+```
+$ curl -sk -o /dev/null -w 'static /      -> %{http_code}\n' https://localhost/
+static /      -> 200
+$ curl -sk -o /dev/null -w 'proxied /v1  -> %{http_code}\n' https://localhost/v1/healthz
+proxied /v1  -> 502
+```
+
+The PWA still loads and the API is 502 — so "the site loads" is not evidence the
+API booted. And the proxy error is **not** `connection refused`:
+
+```
+web-1  | {"level":"error","ts":1792016164.8125532,"logger":"http.log.error.log0","msg":"dial tcp: lookup api on 127.0.0.11:53: server misbehaving","request":{...,"uri":"/v1/healthz",...},"duration":0.005412973,"status":502,"err_id":"sw5hbwhje","err_trace":"reverseproxy.statusError (reverseproxy.go:1390)"}
+```
+
+It is Docker's embedded DNS failing to resolve the service name, because the
+`api` container is being torn down and recreated constantly. Anyone reading this
+as "Caddy cannot find the api service" and editing `GAMEMATCH_API` will fix
+nothing. (The raw log line is a single line whose `request` object holds the full
+headers and TLS detail; it is abbreviated to `...` here for width. No value in the
+line has been altered.)
+
+### Step 5 — restore local config
+
+```bash
+mv .env.local.bak .env
+docker compose up -d --force-recreate api
+docker compose ps
+```
+
+```
+NAME                 IMAGE                  COMMAND                  SERVICE   CREATED              STATUS                    PORTS
+gamematch-api-1      gamematch-api:latest   "/usr/local/bin/game…"   api       14 seconds ago   Up 10 seconds (healthy)   8000/tcp
+gamematch-backup-1   alpine:3.24            "sh -c 'apk add --no…"   backup    2 minutes ago    Up 2 minutes (healthy)    
+gamematch-web-1      gamematch-web:latest   "caddy run --config …"   web       2 minutes ago    Up About a minute         
+```
+
+```
+$ docker compose logs api | tail -3
+api-1  | 2026/10/14 22:16:11 gamematch listening on http://0.0.0.0:8000 (data dir /data, debug=true)
+api-1  | 2026/10/14 22:16:13 GET /v1/healthz 200 0s
+
+$ curl -sk -X POST https://localhost/v1/auth/otp/start -d '{"phone":"+15551237777"}'
+{"devCode":"123456","ok":true}
+```
+
+`debug=true` in the boot line, and `devCode` is back. That last line is the
+control for step 3: **the same request returns `devCode` under
+`APP_ENV=local`/`APP_DEBUG=true` and omits it under production**, on the same
+stack, minutes apart.
+
+### Summary for the runbook
+
+Two things an operator needs to know that the plan does not say:
+
+1. **`.env` must not carry `DEV_OTP` into production, even in the local block.**
+   The whole point of switching hosts is editing values in place, and `DEV_OTP`
+   survives that edit. `Validate()` catches it, loudly — but the deploy fails
+   first time with `DEV_OTP (must be unset...)`, which reads like a config bug
+   rather than the documented "edit the local block into the VPS block"
+   instruction. Delete the line, do not just change `APP_ENV`.
+2. **A production misconfiguration shows as a crash loop, not as `Exited`.**
+   Because of `restart: unless-stopped`, check the exit code with `docker
+   inspect`, not `docker compose ps`. The symptom an operator will actually see
+   on the site is a PWA that loads and an API that 502s.
+
+Both belong in the VPS section as written.
