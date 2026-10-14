@@ -92,11 +92,22 @@ services:
     # rather than finished. 30s matches the api service.
     stop_grace_period: 30s
 
-  # The scheduled backup: scripts/backup.sh, unchanged, on a 6-hourly loop.
+  # The scheduled backup: scripts/backup.sh on a 6-hourly loop.
   #
   # It replaces the gamematch-backup.timer systemd unit for the compose stack.
   # Both run the same script; only the scheduler differs (hourly on the host,
-  # every 6 hours here). See docs/runbooks/restore.md for the restore side.
+  # every 6 hours here).
+  #
+  # RESTORING IS NOT DOCUMENTED FOR THIS STACK YET. docs/runbooks/restore.md is
+  # the systemd runbook: it stops the server with `systemctl stop gamematch`
+  # and restores out of /var/lib/gamematch into /backup/gamematch. For this
+  # stack those are `docker compose stop api`, ./data and ./backups, and the
+  # api runs as uid 10001 rather than the gamematch user. Its REASONING still
+  # applies unchanged — why .backup and not cp, why the -wal sidecar must be
+  # deleted before a restore — but its commands do not, and following them here
+  # would restore from a directory this stack never writes to. Task 7 rewrites
+  # that runbook; until then read it for the argument and take the paths from
+  # this file.
   backup:
     image: alpine:3.24
     # DATA_DIR is not optional here. The script's built-in default is
@@ -106,23 +117,71 @@ services:
     # than as an argument because $1 is the OUTPUT directory, not the input.
     environment:
       DATA_DIR: /data
-    # Runs once immediately and then every 6 hours, so a fresh `up` takes a
-    # first backup without waiting out the interval. The script exits non-zero
+    # Runs once shortly after start and then every 6 hours, so a fresh `up` takes
+    # a first backup without waiting out the interval. The script exits non-zero
     # on any failure (no sqlite3, no database, a snapshot that fails its
     # integrity or schema check); `sh -c` has no `set -e`, so a failed run logs
     # and the loop continues to the next iteration rather than killing the
     # container and restarting it.
     #
+    # The sleep is not decoration. `depends_on: service_started` below only
+    # means the api CONTAINER is running, not that gamematch.db exists: on a
+    # first up against an empty ./data the database is created by the api's
+    # migrations a moment later. Without the sleep the first iteration can win
+    # that race, backup.sh exits 1 on a database that did not exist yet, and the
+    # retry is 6 hours away.
+    #
     # `apk add` rather than a baked image: the base is stock alpine, which has
     # neither. `sqlite` is the package name — there is no `sqlite3` package on
     # alpine (apk: "sqlite3 (no such package)") — and `bash` is needed because
-    # the script's shebang is #!/usr/bin/env bash. Both run once at start; the
-    # cost is that the container needs network access to the alpine repos, and
-    # will not start without it.
+    # the script's shebang is #!/usr/bin/env bash.
+    #
+    # The cost is that this container needs network access to the alpine repos
+    # on every start. If that fails, PID 1 exits non-zero and
+    # `restart: unless-stopped` retries with backoff for as long as the stack is
+    # up: a permanent crash-restart loop re-hitting the alpine CDN about once a
+    # minute, whose only symptom is a flapping container and a short log.
     command:
       - sh
       - -c
-      - apk add --no-cache bash sqlite >/dev/null && while true; do /scripts/backup.sh /backups; sleep 21600; done
+      - apk add --no-cache bash sqlite >/dev/null && sleep 30 && while true; do /scripts/backup.sh /backups; sleep 21600; done
+    # The loop is built to survive failure, which means "container is Up" says
+    # nothing about whether any backup has succeeded. A run that fails every
+    # 6 hours leaves the service Up forever with nothing to show for it.
+    # This check is the thing that turns that silence into a signal:
+    # `docker compose ps` reports unhealthy when the newest snapshot in
+    # /backups is more than 7 hours old, i.e. one whole interval was missed.
+    #
+    # It reads the directory, not the loop's exit status, so it reports what is
+    # actually on disk rather than how the last iteration happened to go. The
+    # window is one interval plus an hour of slack, so it cannot flap while a
+    # backup is running: the previous snapshot is still inside it, and the new
+    # one only appears once scripts/backup.sh has verified it and renamed it
+    # into place. A partial file is therefore never visible here.
+    #
+    # retries: 1 because this is a state predicate, not a flaky operation —
+    # there is nothing to retry, and a retry would just delay the alarm.
+    #
+    # NOTE: an unhealthy container is NOT restarted. Docker's restart policy
+    # acts on the process exiting, not on health, so this service keeps its
+    # 6-hourly retry going while reporting the failure. That is the intent: the
+    # next successful run should clear this without an operator intervening.
+    healthcheck:
+      test: ["CMD-SHELL", "find /backups -maxdepth 1 -name 'gamematch-*.db' -mmin -420 -print -quit | grep -q ."]
+      # One minute, so `docker compose ps` reflects reality within a minute of
+      # a backup succeeding or the window lapsing. The check is a find over a
+      # directory holding at most ~56 files; the frequency costs nothing.
+      interval: 60s
+      timeout: 10s
+      # Docker runs the first check one `interval` in, so this must be LONGER
+      # than the interval to have any effect — a start-period shorter than the
+      # interval never suppresses a check, because none has run yet. It covers
+      # the whole startup path: the sleep above, apk add, and a first backup of
+      # a database that may be far larger than the demo one. Until it elapses
+      # the container reports "starting" however the checks are going, which is
+      # what stops a healthy fresh stack from being born reporting failures.
+      start_period: 180s
+      retries: 1
     volumes:
       - ./scripts:/scripts:ro
       # NOT :ro. This is the one place the obvious choice is wrong, so it is
@@ -138,32 +197,45 @@ services:
       #   api stopped   -> SQLite checkpoints on clean close and deletes them
       #                  -> :ro fails with rc=1
       #
-      # Both states are real here. The first backup runs immediately at `up`,
+      # Both states are real here. The first backup runs shortly after `up`,
       # before the api has opened the database, and any backup scheduled while
       # the api is restarting hits the second. Verified against alpine:3.24:
       # the same script on the same file returned "unable to open database
       # file" with :ro and "backup: wrote ..." with :rw.
       #
-      # The risk of :rw is that this container could corrupt the live database.
-      # It is bounded: the image is stock alpine, the only commands are apk,
-      # sleep and the backup script, and the script only reads $DATA_DIR — its
-      # one write target is .backup's destination in /backups. Nothing here
-      # deletes or truncates $DATA_DIR. That bounds the risk from malice, not
-      # from a bug or a bad interaction, so this is a real reduction in defence
-      # in depth, accepted because the alternative is a backup that does not run.
+      # The risk of :rw is that this container could write to the live
+      # database, and it does: sqlite3 .backup opens the source read-write, so
+      # SQLite creates -shm and -wal in $DATA_DIR while it runs. What keeps that
+      # safe is narrower than "the script only reads" and worth stating exactly:
+      # those sidecars are created with the OWNERSHIP OF THE DATABASE FILE, not
+      # of the caller, and SQLite removes them again when it closes cleanly.
+      # Verified: with ./data owned by uid 10001 and this container running as
+      # root, the sidecars appeared as 10001:10001 and were gone after the run.
+      # So this container cannot leave behind root-owned sidecars in ./data that
+      # lock the api out of its own database, and cannot delete a sidecar the
+      # api is relying on — it only ever removes the ones it made.
       - ./data:/data
       - ./backups:/backups
     restart: unless-stopped
     depends_on:
       api:
+        # service_started, not service_healthy, and not because of the mount:
+        # the :rw above already settles the sidecar question, and this key only
+        # orders startup. service_healthy would be a correct choice here if the
+        # backup ever needed the database to exist on principle, and it should
+        # not be read as forbidden.
         condition: service_started
-    # Do NOT add depends_on: service_healthy here to "fix" the mount. It would
-    # mask the real cause above and would still fail whenever the api is
-    # restarted on its own, which is when a backup is most wanted.
 
 # Named, not anonymous: only `docker compose down -v` removes these, and the
-# runbook must not use it — the app's ./data is a bind mount and survives that
-# anyway, but the certificates above would not.
+# runbook must not use it — the app's ./data and ./backups are bind mounts and
+# survive it, but the certificates above would not.
+#
+# The asymmetry worth stating: of the three things this stack keeps, only two
+# come back. ./data is regenerated by the running server, and the certificates
+# by ACME, which rate-limits duplicate issuance to 5 per week per registered
+# domain — enough to lock a domain out for the rest of the week. ./backups is
+# the one that comes back from nothing. `down -v` does not delete it, which is
+# precisely why it must not be used casually.
 volumes:
   caddy-data:
   caddy-config:
