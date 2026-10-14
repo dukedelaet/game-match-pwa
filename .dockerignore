@@ -18,20 +18,27 @@
 node_modules
 **/node_modules
 
-# Local state: the demo database, its WAL sidecars and uploads, and the
-# backup directory the compose stack writes to.
+# Local state: the demo database, its WAL sidecars and uploads, the backup
+# directory the compose stack writes to, and the ~19 MB of build output a local
+# `go build -o bin/…` leaves in apps/server/bin. That last one matters beyond
+# context size: COPY apps/server/ ./ copies the whole directory, so an excluded
+# bin/ is what keeps it from invalidating that layer on every local rebuild.
 apps/server/data
+apps/server/bin
 data
 backups
 .caddytest
 
-# Secrets. Nothing here is read at build time, and a Dockerfile that needed one
-# would be wrong.
-.env
-.env.*
+# Secrets, at any depth. A bare `.env` pattern is root-anchored in this file
+# format, so apps/server/.env and apps/web/.env would match neither it nor
+# `.env.*` — and COPY apps/server/ ./ would put one in the build stage. It still
+# would not reach the final image (only /out/gamematch is copied), but it would
+# land in BuildKit's content store.
+**/.env
+**/.env.*
 
-# Noise.
-*.log
+# Noise, at any depth.
+**/*.log
 
 # Not in any image, and large.
 docs

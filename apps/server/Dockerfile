@@ -31,8 +31,12 @@ COPY apps/server/ ./
 # no dist/ are copied into the runtime stage — only this one file.
 RUN go build -trimpath -ldflags="-s -w" -o /out/gamematch ./cmd/gamematch
 
-# Runtime stage.
-FROM alpine AS runtime
+# Runtime stage. Pinned to the minor release for the same reason the build stage
+# is pinned: an image meant to make a deployment reproducible cannot have a
+# floating base. `apk add` below still resolves the newest patch of ca-certs and
+# tzdata inside 3.24, so the pin bounds the base rather than freezing every
+# package in it.
+FROM alpine:3.24 AS runtime
 
 # ca-certificates is what outbound TLS needs (Twilio, Turnstile, web push).
 # tzdata is the zoneinfo database; the alpine base carries none, and the store
@@ -59,7 +63,10 @@ ENV ADDR=0.0.0.0:8000 \
 # Caddy's reverse_proxy has no health endpoint to point at unless the API
 # declares one, and `depends_on: service_healthy` needs something to poll. Busybox
 # wget ships with alpine, so no client has to be added for this.
-HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+# --start-interval probes every 2s while the container is starting and settles to
+# --interval afterwards, so a dependent service does not sit idle for the first
+# full interval waiting for the first answer.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --start-interval=2s --retries=3 \
   CMD wget -q -O /dev/null http://127.0.0.1:8000/v1/healthz || exit 1
 
 EXPOSE 8000
@@ -71,11 +78,12 @@ USER gamematch:gamematch
 # also writes the module path lookup away from the data directory entirely.
 WORKDIR /
 
-# CMD, not ENTRYPOINT, and the difference is the point: `docker run --rm
-# gamematch-api:latest id -u` must run id(1) and print 10001. An ENTRYPOINT on
-# the binary turns that into `gamematch id -u`, which is not a subcommand the
-# binary knows — it starts a server and hangs instead of answering. Compose
-# declares `entrypoint: ["/usr/local/bin/gamematch"]` on the api service, which
-# keeps `docker compose run --rm api seed` appending seed to the binary.
+# ENTRYPOINT, because the binary is the program: `docker run gamematch-api
+# seed` is `gamematch seed`, which is what the binary's subcommands
+# (main.go: `seed`, `vapid`) exist for, and it means compose does not need
+# `entrypoint:` on the api service to run `docker compose run --rm api seed`.
+# Running something other than the binary takes an explicit override —
+# `docker run --rm --entrypoint id gamematch-api -u`, which is how the
+# non-root UID is verified.
 STOPSIGNAL SIGTERM
-CMD ["/usr/local/bin/gamematch"]
+ENTRYPOINT ["/usr/local/bin/gamematch"]
