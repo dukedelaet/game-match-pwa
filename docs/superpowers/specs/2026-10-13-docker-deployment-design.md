@@ -196,13 +196,33 @@ inside the image, with no environment-dependent working directory. #2 and #3
 are fixed in the Caddyfile. Security headers (CSP, HSTS, X-Frame-Options,
 Permissions-Policy), which the audit found missing, are added at the same time.
 
-**A caveat, recorded honestly:** while verifying the Caddyfile locally, the
-`caddy` binary available on this machine turned out to be a broken build that
-panicked on any config, including a two-line one. That was a local tooling
-problem, not a repo problem, and a freshly built binary works. But it means the
-Caddy changes in this work will be verified by running the compose stack, not
-by the local `caddy` binary. If verification cannot be completed in this
-environment, that must be stated rather than assumed.
+**Verification, corrected.** An earlier draft of this spec claimed the shipped
+Caddyfile "panics Caddy on startup" when the log directory is missing. **That
+claim was wrong and is retracted.** The host `caddy` binary panicked on every
+config, including a two-line one and a pure-JSON config with no modules; the
+cause is Caddy 2.10.2 being incompatible with Go 1.27, not the repository's
+configuration. The `caddy:2.10.2-alpine` image bundles its own toolchain and is
+unaffected — it starts and serves correctly. Verification therefore runs the
+image, never the host binary.
+
+Verified against the shipped `deploy/Caddyfile` in the image, unmodified:
+
+| Check | Result |
+| --- | --- |
+| Starts without panic | confirmed |
+| `GET /` | 200 |
+| `GET /boot` | 200 |
+| `GET /manifest.webmanifest` | 200 |
+| `GET /v1/healthz` | 502 (no API container running) |
+| `Cache-Control` on `/` | `no-cache` |
+| `Cache-Control` on `/boot` | **absent** — confirmed defect |
+| CSP / HSTS / X-Frame-Options / Permissions-Policy | **all absent** — confirmed defect |
+| Access log rotation (`roll_size` etc.) | **not configured** — confirmed defect |
+| SPA served with `GAMEMATCH_ROOT` unset and cwd `/` | **404 on `/`, `/boot`, `/assets`** — confirmed defect |
+
+The relative-root row is the serious one: it is the shipped default, and
+`/v1/healthz` still returns 200, so a runbook check that only probes the API
+reports success while the site is down.
 
 ## Files
 
@@ -294,4 +314,4 @@ design is most concerned with.
 | `.env` drift between local and VPS | One file, two documented configurations. Verification step 11 boots production mode locally. |
 | `./data` owned by the wrong UID on the host | Runbook states the `chown` explicitly as a first-run step. |
 | `APP_ENV=local` hides production-only failures | Verification step 12 exercises the production refusal path through the container. |
-| Caddyfile changes unverifiable locally (broken local `caddy` binary) | Verify by running the stack, which uses the `caddy` image, not the host binary. If that is not possible here, say so rather than claiming verification. |
+| Host `caddy` binary is unusable (Caddy 2.10.2 vs Go 1.27) | Verification uses the `caddy:2.10.2-alpine` image, which bundles its own toolchain and works. Confirmed serving. Never verify with the host binary. |

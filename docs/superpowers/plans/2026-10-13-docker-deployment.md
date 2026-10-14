@@ -44,7 +44,21 @@ The shipped Caddyfile has four defects, all verified in the audit, and it **pani
 - Consumes: `apps/web/dist/` (built output), `http://api:8000` (the `api` service, from Task 3).
 - Produces: a `deploy/Caddyfile` that works with an absolute `GAMEMATCH_ROOT`, an existing log directory, and no environment-dependent working directory. Task 2's `web` image copies this file verbatim.
 
-**Note on verification:** the `caddy` binary at `/home/duke/.local/share/mise/installs/go/1.27.1/bin/caddy` is a **broken build that panics on any config, including a two-line one**. Do not use it. The step below uses `docker run --rm -v "$PWD/deploy:/etc/caddy:ro" -v "$PWD/apps/web/dist:/srv:ro" -v "$PWD/.caddytest:/var/log/caddy" caddy:2.10.2-alpine caddy run --config /etc/caddy/Caddyfile`, which uses the published image rather than the host binary.
+**Note on verification:** do **not** use the host `caddy` binary. It panics on
+every config, including a two-line one and a pure-JSON config with no modules:
+Caddy 2.10.2 is incompatible with Go 1.27 (`expected ModuleMap because
+inline_key is empty`). The `caddy:2.10.2-alpine` image bundles its own
+toolchain, is unaffected, and was confirmed to start and serve. Every
+verification below runs the image.
+
+On this machine, Docker requires the `docker` group and the session must have
+been started after joining it. Wrap Docker commands with
+`newgrp docker <<< "$*"` if the socket returns permission denied.
+
+The harness deliberately sets an absolute `GAMEMATCH_ROOT` and creates the log
+directory, so that Step 2 isolates the cache-rule and header defects from the
+relative-root defect. The relative root is verified separately in Task 5
+step 3, where it is the real problem.
 
 - [ ] **Step 1: Write the verification harness**
 
@@ -372,7 +386,18 @@ curl -s -o /dev/null -w '%{http_code}\n' --max-time 3 http://127.0.0.1:8000/v1/h
 
 Expected: `api` shows no `0.0.0.0:8000->` mapping, and the curl returns `000` (connection refused). This is the single assertion that would catch a regression in the property this design exists to protect. If it returns `200`, stop and fix before continuing.
 
-- [ ] **Step 3: Assert the proxy reaches the API, not just that the API is up**
+- [ ] **Step 3: Assert the shipped relative-root default is not in use**
+
+The most dangerous of the three Caddyfile defects: with `GAMEMATCH_ROOT` unset and cwd `/`, every static asset 404s while `/v1/healthz` still returns 200, so a runbook check that probes only the API reports success.
+
+```bash
+docker compose exec web sh -c 'ls /srv/dist/index.html'   # must exist
+curl -sk -o /dev/null -w '%{http_code}\n' https://localhost/assets/$(ls apps/web/dist/assets | grep -m1 '\.js$')
+```
+
+Expected: `200`. If it is `404`, the root is resolving relative to a working directory rather than to the image path.
+
+- [ ] **Step 4: Assert the proxy reaches the API, not just that the API is up**
 
 ```bash
 curl -sk -o /dev/null -w '%{http_code}\n' https://localhost/v1/healthz
@@ -380,7 +405,7 @@ curl -sk -o /dev/null -w '%{http_code}\n' https://localhost/v1/healthz
 
 Expected: `200`. A `000` here means Caddy cannot reach `api` — the failure that would happen if `ADDR` were left at `127.0.0.1:8000`.
 
-- [ ] **Step 4: Assert the SPA is served with the right caching**
+- [ ] **Step 5: Assert the SPA is served with the right caching**
 
 ```bash
 curl -sk -o /dev/null -w '%{http_code}\n' https://localhost/boot
@@ -390,7 +415,7 @@ curl -sk -o /dev/null -w '%{http_code}\n' https://localhost/deep/spa/route
 
 Expected: `200`, `Cache-Control: no-cache`, `200`.
 
-- [ ] **Step 5: Assert security headers**
+- [ ] **Step 6: Assert security headers**
 
 ```bash
 for h in Content-Security-Policy Strict-Transport-Security X-Frame-Options Permissions-Policy X-Content-Type-Options; do
@@ -400,7 +425,7 @@ done
 
 Expected: `1` for each.
 
-- [ ] **Step 6: Assert data survives a restart**
+- [ ] **Step 7: Assert data survives a restart**
 
 ```bash
 BEFORE="$(sqlite3 data/gamematch.db 'SELECT count(*) FROM users;')"
@@ -420,7 +445,7 @@ sqlite3 data/gamematch.db "SELECT name FROM users WHERE phone_e164_hash = (SELEC
 
 Expected: `after` greater than `before`, and the last query printing a name. This proves the bind mount is the real state, and it exercises WAL locking — a filesystem that cannot support it fails right here. `APP_ENV=local` must be set or the OTP cannot be read, which is why the step asserts `$CODE` is non-empty rather than assuming it.
 
-- [ ] **Step 7: Assert the data directory is host-owned, not root-owned**
+- [ ] **Step 8: Assert the data directory is host-owned, not root-owned**
 
 ```bash
 ls -ld data data/photos
@@ -429,7 +454,7 @@ docker compose exec api ls -ld /data
 
 Expected: both report UID 10001. A mismatch here is the Review Focus item about ownership, and it is the most likely first-run failure on the VPS.
 
-- [ ] **Step 8: Assert logs and rotation**
+- [ ] **Step 9: Assert logs and rotation**
 
 ```bash
 docker compose logs --tail 20 web
@@ -438,7 +463,7 @@ docker compose exec web ls -la /var/log/caddy
 
 Expected: Caddy started cleanly with no panic, and the access log exists with `roll_size` configured.
 
-- [ ] **Step 9: Record the evidence**
+- [ ] **Step 10: Record the evidence**
 
 Paste the actual outputs of steps 2–8 into `docs/runbooks/deploy-docker.md` as a "verified on local Docker" section. Do not paraphrase; the next person needs to see the real numbers.
 
