@@ -145,7 +145,7 @@ services:
       - sh
       - -c
       - apk add --no-cache bash sqlite >/dev/null && sleep 30 && while true; do /scripts/backup.sh /backups; sleep 21600; done
-    # The loop is built to survive failure, which means "container is Up" says
+# The loop is built to survive failure, which means "container is Up" says
     # nothing about whether any backup has succeeded. A run that fails every
     # 6 hours leaves the service Up forever with nothing to show for it.
     # This check is the thing that turns that silence into a signal:
@@ -154,10 +154,19 @@ services:
     #
     # It reads the directory, not the loop's exit status, so it reports what is
     # actually on disk rather than how the last iteration happened to go. The
-    # window is one interval plus an hour of slack, so it cannot flap while a
-    # backup is running: the previous snapshot is still inside it, and the new
-    # one only appears once scripts/backup.sh has verified it and renamed it
-    # into place. A partial file is therefore never visible here.
+    # new snapshot only appears once scripts/backup.sh has verified it and
+    # renamed it into place, so a partial file is never visible here.
+    #
+    # THE 420-MINUTE WINDOW IS AN ASSUMPTION, not a measured margin. The loop
+    # period is not 6h but `sleep 21600` PLUS the duration of the run itself,
+    # so the slack over a 6h interval is 60 minutes MINUS however long backups
+    # take. Measured here: a 158M database backed up in ~20s, so the slack is
+    # real at that size. A run that took over an hour would shrink it below
+    # zero and false-alarm every cycle -- the check would report unhealthy
+    # between every pair of snapshots even though nothing had failed. That is
+    # why the number is stated rather than left implicit: if this database
+    # grows to where backups take an hour, raise -mmin here, or switch the
+    # check to count snapshots newer than the window instead of ageing one.
     #
     # retries: 1 because this is a state predicate, not a flaky operation —
     # there is nothing to retry, and a retry would just delay the alarm.
@@ -165,7 +174,7 @@ services:
     # NOTE: an unhealthy container is NOT restarted. Docker's restart policy
     # acts on the process exiting, not on health, so this service keeps its
     # 6-hourly retry going while reporting the failure. That is the intent: the
-    # next successful run should clear this without an operator intervening.
+    # next successful run should clear it without an operator intervening.
     healthcheck:
       test: ["CMD-SHELL", "find /backups -maxdepth 1 -name 'gamematch-*.db' -mmin -420 -print -quit | grep -q ."]
       # One minute, so `docker compose ps` reflects reality within a minute of
@@ -175,11 +184,18 @@ services:
       timeout: 10s
       # Docker runs the first check one `interval` in, so this must be LONGER
       # than the interval to have any effect — a start-period shorter than the
-      # interval never suppresses a check, because none has run yet. It covers
-      # the whole startup path: the sleep above, apk add, and a first backup of
-      # a database that may be far larger than the demo one. Until it elapses
-      # the container reports "starting" however the checks are going, which is
-      # what stops a healthy fresh stack from being born reporting failures.
+      # interval never suppresses a check, because none has run yet.
+      #
+      # It buys three minutes of grace from container start, covering the sleep
+      # above, apk add, and a first backup. That is enough for the databases
+      # measured here (a 1.4G backup takes ~20s), and it is deliberately NOT
+      # claimed to be more than that: on a FIRST run there is no previous
+      # snapshot to keep the window warm, so a first backup that outlasted this
+      # period would report unhealthy part-way through and then clear itself on
+      # completion. That is cosmetic and self-correcting, but it is the honest
+      # boundary — on a first run the check has no earlier snapshot to fall back
+      # on, which is also why the no-flap argument above only holds once at
+      # least one backup has landed.
       start_period: 180s
       retries: 1
     volumes:

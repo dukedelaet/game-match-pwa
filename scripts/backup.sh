@@ -29,14 +29,14 @@ STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 DB_OUT="$BACKUP_DIR/gamematch-$STAMP.db"
 PHOTOS_OUT="$BACKUP_DIR/photos-$STAMP.tar.gz"
 
-# Build every artefact under a hidden subdirectory and move it into place only
-# once it has been verified.
+# Build every artefact under a private scratch directory, and move it into place
+# only after it has been verified and flushed to disk.
 #
-# This is not tidiness, it is the difference between a snapshot and a file that
-# looks like one. A backup interrupted part-way through the write -- container
-# SIGKILL, power loss, the disk filling up -- otherwise leaves the result at its
-# FINAL name, and the checks below never run because they are a separate
-# process after a write that has already been killed.
+# This is the difference between a snapshot and a file that looks like one. A
+# backup interrupted part-way through the write -- container SIGKILL, the OOM
+# killer, the disk filling up -- otherwise leaves the result at its FINAL name,
+# and the checks never run because they are a separate process after a write
+# that has already been killed.
 #
 # What survives that way is not recognisably broken. A truncated SQLite file is
 # still a structurally valid database: verified on alpine:3.24, a snapshot
@@ -45,19 +45,43 @@ PHOTOS_OUT="$BACKUP_DIR/photos-$STAMP.tar.gz"
 # restore runbook tells an operator to check. Worse, the first reader to open
 # such a file rolls back its hot journal and truncates it to 0 bytes, after
 # which it is a valid EMPTY database under a name indistinguishable from a good
-# snapshot. It would then sit in the backup directory for the full 14-day
-# prune window looking exactly like the backup it is not.
+# snapshot, and it would sit there for the full 14-day prune window.
 #
-# Writing to a temporary name and renaming means the final path only ever holds
-# a file that passed every check. mv within one filesystem is rename(2), which
-# is atomic, so a snapshot appears whole or not at all.
-TMP_DIR="$BACKUP_DIR/.tmp"
-mkdir -p "$TMP_DIR"
-# Clear debris an interrupted run left here. A completed run moves its only
-# file out, so anything still present is from a run that died. Concurrent runs
-# against one BACKUP_DIR remain unsupported, as they already were: two runs
-# within the same second share a STAMP and collide either way.
-rm -f "$TMP_DIR"/*
+# Each artefact therefore appears at its final path whole or not at all. The
+# SET is not atomic: a crash between the two renames publishes a database whose
+# photos archive has not landed yet. Making the pair atomic needs a manifest or
+# a single directory rename, which is more than this script promises.
+
+# mktemp -d, not a fixed name. Two backups CAN overlap -- `docker compose run
+# --rm backup` alongside the scheduled loop, or an `up -d` that recreates the
+# container mid-run -- and with a shared scratch directory whichever starts
+# second deletes the first's in-flight file. Verified on a 1.4G database with
+# two runs 5s apart: the second run's cleanup killed the first with "Error:
+# disk I/O error", rc=1. The systemd timer cannot hit this (Type=oneshot never
+# overlaps), but the container has no such guarantee.
+# A unique directory also makes leftover debris attributable to the run that
+# left it. It sits inside $BACKUP_DIR, so it is on the same filesystem and mv
+# remains rename(2).
+TMP_DIR="$(mktemp -d "$BACKUP_DIR/.tmp.XXXXXX")"
+# mktemp -d creates 0700. Back to 0755: the scratch holds nothing secret (it
+# becomes a snapshot in ./backups, which is world-readable anyway), and debris
+# that nobody can list cannot be attributed to the run that left it, which is
+# the other half of using a unique name.
+chmod 755 "$TMP_DIR"
+# Discard this run's scratch on every exit path, including the guarded failures
+# below. This cannot catch SIGKILL -- nothing can -- so the sweep below is what
+# bounds that debris.
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+# Remove scratch left by runs that were killed outright, including the fixed
+# .tmp directory used before mktemp.
+#
+# Bounded by AGE rather than by "whatever is there", because an overlapping
+# run's scratch is younger than 24h and must survive. This runs before the
+# snapshot is written rather than at the end, because the retention window
+# below only executes at the end of a fully successful run: if backups kept
+# failing, debris from an earlier kill would otherwise sit forever.
+find "$BACKUP_DIR" -maxdepth 1 -name '.tmp*' -type d -mmin +1440 -exec rm -rf {} +
 
 DB_TMP="$TMP_DIR/gamematch-$STAMP.db"
 
@@ -69,14 +93,19 @@ sqlite3 "$DATA_DIR/gamematch.db" ".backup '$DB_TMP'"
 # because that is the name an operator goes looking for.
 if ! sqlite3 "$DB_TMP" 'PRAGMA integrity_check;' | grep -qx ok; then
 	echo "backup: integrity check failed for $DB_OUT" >&2
-	rm -f "$DB_TMP"
 	exit 1
 fi
 if ! sqlite3 "$DB_TMP" 'SELECT count(*) FROM sqlite_master;' | grep -qE '^[1-9]'; then
 	echo "backup: snapshot has no schema" >&2
-	rm -f "$DB_TMP"
 	exit 1
 fi
+
+# rename(2) makes the directory entry atomic, but only for bytes the kernel has
+# already written. The page cache outlives a SIGKILL, which is the case all of
+# the above is about, but a host that loses power after the rename can still
+# surface the garbage file at the final name -- the same directory, for one
+# fsync every six hours. `sync FILE` is supported by both busybox and coreutils.
+sync "$DB_TMP"
 
 mv "$DB_TMP" "$DB_OUT"
 
@@ -90,18 +119,14 @@ if [ -d "$DATA_DIR/photos" ]; then
 	tar czf "$PHOTOS_TMP" -C "$DATA_DIR" photos
 	if ! gzip -t "$PHOTOS_TMP" 2>/dev/null; then
 		echo "backup: photos archive failed its check for $PHOTOS_OUT" >&2
-		rm -f "$PHOTOS_TMP"
 		exit 1
 	fi
+	sync "$PHOTOS_TMP"
 	mv "$PHOTOS_TMP" "$PHOTOS_OUT"
 fi
 
 # Keep 14 days. Runs hourly, so this is two weeks of history.
 find "$BACKUP_DIR" -name 'gamematch-*.db' -mtime +14 -delete
 find "$BACKUP_DIR" -name 'photos-*.tar.gz' -mtime +14 -delete
-
-# Leave no empty scratch directory behind. Fails harmlessly if an interrupted
-# run left debris, which the next run sweeps.
-rmdir "$TMP_DIR" 2>/dev/null || true
 
 echo "backup: wrote $DB_OUT"
