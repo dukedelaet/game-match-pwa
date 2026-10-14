@@ -66,7 +66,7 @@ docker_run rm -f gm-caddy-verify >/dev/null 2>&1 || true
 # a command line, and shell prefixes would not survive that. The log directory
 # is mounted somewhere other than /var/log/caddy, so a hardcoded path in the
 # config shows up as a failure instead of passing by coincidence.
-docker_run run -d --name gm-caddy-verify -p "$PORT:$PORT" \
+docker_run run -d --name gm-caddy-verify -p "127.0.0.1:$PORT:$PORT" \
   -e GAMEMATCH_ROOT="$CTOR_DIST" -e GAMEMATCH_SITE="localhost:$PORT" \
   -e GAMEMATCH_LOG_DIR="$CTOR_LOGDIR" \
   -v "$ROOT/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" \
@@ -86,14 +86,44 @@ check "GET /boot (PWA start_url) serves"   200 "$(status /boot)"
 check "GET /deep/spa/route falls back"     200 "$(status /deep/spa/route)"
 check "/boot is not cached"                "no-cache" "$(header /boot Cache-Control)"
 
-asset="$(ls "$WORKDIR/assets" | grep -m1 '\.js$')"
-check "asset is immutable"                 "public, max-age=31536000, immutable" \
-      "$(header "/assets/$asset" Cache-Control)"
+# An absent or js-free assets/ must produce a FAIL line, not kill the script
+# where set -euo pipefail would swallow every check that follows.
+asset=""
+for f in "$WORKDIR"/assets/*.js; do
+  if [ -e "$f" ]; then asset="${f##*/}"; break; fi
+done
+if [ -z "$asset" ]; then
+  printf '  FAIL asset is immutable: no .js under %s/assets\n' "$WORKDIR"; fail=1
+else
+  check "asset is immutable"                 "public, max-age=31536000, immutable" \
+        "$(header "/assets/$asset" Cache-Control)"
+fi
 check "nosniff present"                    "nosniff" "$(header / X-Content-Type-Options)"
 check "CSP present"                        "1" "$(test -n "$(header / Content-Security-Policy)" && echo 1 || echo 0)"
 check "HSTS present"                       "1" "$(test -n "$(header / Strict-Transport-Security)" && echo 1 || echo 0)"
 check "X-Frame-Options present"            "1" "$(test -n "$(header / X-Frame-Options)" && echo 1 || echo 0)"
 check "access log honours \$GAMEMATCH_LOG_DIR" "1" \
       "$(test -s "$LOGDIR/gamematch-access.log" && echo 1 || echo 0)"
+
+# Rotation is one of the three defects this config fixed and nothing about a
+# response reveals it, so assert it on the adapted config. Otherwise an edit
+# that drops roll_* still passes everything above.
+# `|| true`: adapt exits non-zero on a broken config, and under set -e that
+# would abort the script here instead of reporting the failure below.
+adapted="$(docker_run run --rm \
+  -v "$ROOT/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" \
+  caddy:2.10.2-alpine caddy adapt --config /etc/caddy/Caddyfile 2>/dev/null \
+  | tr -d ' \t\r\n' || true)"
+if [ -z "$adapted" ]; then
+  printf '  FAIL access log rotation configured: the config did not adapt\n'; fail=1
+else
+  # 100MiB/10/720h adapt to 100/10/30 (days). Whitespace is stripped above so
+  # this does not depend on how adapt happens to format its output.
+  missing=""
+  for needle in 'roll_size_mb":100' 'roll_keep":10' 'roll_keep_days":30'; do
+    case "$adapted" in *"$needle"*) ;; *) missing="$missing $needle" ;; esac
+  done
+  check "access log rotation configured"     "" "$missing"
+fi
 
 exit "$fail"
