@@ -195,15 +195,17 @@ harness that runs the published caddy image rather than the host binary."
 Run these before the files exist.
 
 ```bash
-cd apps/server && CGO_ENABLED=0 docker build -t gamematch-api:latest . && \
-  docker run --rm gamematch-api:latest id -u
+docker build -t gamematch-api:latest -f apps/server/Dockerfile . && \
+  docker run --rm --entrypoint id gamematch-api:latest -u
 ```
 
 Expected: FAIL — no `Dockerfile` in `apps/server`.
 
 - [ ] **Step 2: Create `apps/server/Dockerfile`**
 
-Multi-stage. Build stage `golang:1.27.2-alpine` matching `mise.toml`; runtime `alpine` with `ca-certificates` and `tzdata` only. Non-root UID 10001 with a matching `/data`.
+Multi-stage. Build stage `golang:1.27.2-alpine` matching `mise.toml`; runtime base pinned to `alpine:3.24` with `ca-certificates` and `tzdata` only. Non-root UID 10001 with a matching `/data`.
+
+Set `ENTRYPOINT ["/usr/local/bin/gamematch"]`, not `CMD`: the binary is the program, so `docker run <image> seed` must run `gamematch seed`. Verify the UID with `docker run --rm --entrypoint id gamematch-api:latest -u` — using `CMD` to satisfy that assertion would invert the image's default semantics.
 
 - [ ] **Step 3: Create `apps/web/Dockerfile`**
 
@@ -222,9 +224,9 @@ Add `.env` variants (`#97` notes `.env.*` is not ignored), `/data/`, `/backups/`
 ```bash
 docker build -t gamematch-api:latest apps/server
 docker build -t gamematch-web:latest apps/web
-docker run --rm gamematch-api:latest id -u          # 10001
-docker run --rm gamematch-api:latest ls /srv         # must fail: no dist in the API image
-docker run --rm gamematch-api:latest sh -c 'which go' # must fail: no toolchain
+docker run --rm --entrypoint id gamematch-api:latest -u   # 10001
+docker run --rm --entrypoint ls gamematch-api:latest -d /srv/dist   # must fail: no dist in the API image
+docker run --rm --entrypoint sh gamematch-api:latest -c 'which go'  # must fail: no toolchain
 docker run --rm gamematch-web:latest ls /srv/dist/index.html
 ```
 
@@ -258,6 +260,12 @@ prebuilt output, so a frontend change does not invalidate the API image."
 - [ ] **Step 1: Create `docker-compose.yml`**
 
 Three services. `api` declares **no `ports:`**. `web` publishes `${HTTP_PORT:-80}:80` and `${HTTPS_PORT:-443}:443`. `backup` sleeps between runs.
+
+The API image sets `ENTRYPOINT ["/usr/local/bin/gamematch"]` (Task 2), so `docker compose run --rm api seed` works with no `entrypoint:` key on the service. The API also needs `stop_grace_period: 30s` — the server drains for 25s and Docker's default is 10s.
+
+`deploy/Caddyfile` still says `reverse_proxy 127.0.0.1:8000`, which cannot reach a compose sibling container. Change that line to `{$GAMEMATCH_API:127.0.0.1:8000}` and set `GAMEMATCH_API=api:8000` in the web service's environment, so the systemd path keeps working unchanged when no env is set.
+
+Beware: the image's `ENV ADDR=0.0.0.0:8000` is overridden by compose `environment:` but not by a stray `ADDR=` line in `env_file:`. If one appears the API binds loopback and every proxied call 502s with no other symptom.
 
 - [ ] **Step 2: Create `.env.example`**
 
