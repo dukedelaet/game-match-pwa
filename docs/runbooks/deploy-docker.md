@@ -544,10 +544,17 @@ Full procedure, with the reasoning it rests on, in
 docker compose stop api          # nothing may write while you restore
 sudo mv data/gamematch.db data/gamematch.db.pre-restore
 sudo rm -f data/gamematch.db-wal data/gamematch.db-shm
-sudo mv data/photos data/photos.pre-restore      # only if there is an archive below
 sudo cp backups/gamematch-<stamp>.db data/gamematch.db
-sudo tar xzf backups/photos-<stamp>.tar.gz -C data   # guard it — see restore.md
-sudo chown -R 10001:10001 data
+if [ -f "backups/photos-<stamp>.tar.gz" ]; then          # absent on a fresh stack
+    if [ -d data/photos ]; then
+        sudo mv data/photos data/photos.pre-restore
+    fi
+    sudo tar xzf "backups/photos-<stamp>.tar.gz" -C data
+    sudo chown -R 10001:10001 data/photos
+else
+    echo "no photos archive for <stamp>"
+fi
+sudo chown -R 10001:10001 data/gamematch.db
 docker compose start api
 sudo rm -rf data/gamematch.db.pre-restore data/photos.pre-restore   # after verifying
 ```
@@ -963,7 +970,7 @@ assertion it was written to fix.
 
 The blank fourth line is not a missing name in the output — it *is* the new
 user's `name`, which is genuinely NULL: `httpapi/auth.go:192-198` creates the
-row with no `Name`, and `store/users.go:71-79` defaults it to
+row with no `Name`, and `store/users.go:71-79` (pending; `intent` is set by `httpapi/auth.go:195`) defaults it to
 `status=pending, onboarding_step=intent`. Use `quote(u.name)` so NULL is visible
 rather than looking like missing output.
 
@@ -1080,7 +1087,7 @@ With a code issued it is `{"devCode":"123456","ok":true}`. The absence of
 `devCode` *is* the signal.
 
 The limits are `limitOTPStartPerIP = 5` and `limitOTPStartPerPhone = 3` per
-`windowOTP = 15m` (`apps/server/internal/httpapi/ratelimit.go:16-19`), and they
+`windowOTP = 15m` (`apps/server/internal/httpapi/ratelimit.go:16-20`), and they
 are **persisted**, so `docker compose restart api` does not clear them:
 
 ```
@@ -1115,7 +1122,7 @@ never true. It is therefore not a discriminating control on its own — the
 contrast that shows the tautology is the four rows it returns for `$PHONE` in
 (b), against one row (the NULL name) from the corrected join.
 
-The seeded users, for reference — `seed` creates **four** named users, and `House`
+The seeded users, for reference — `seed` creates **four** named users (`Alex`, `Jordan`, `Staff`, `House`), and `House`
 is the only one with a NULL `phone_e164_hash`, which is why the tautological
 query drops it:
 
@@ -1181,7 +1188,7 @@ On a genuinely fresh install that is **benign**: there are no photos to lose,
 and the first backup runs ~35s after `up`, long before anyone can upload
 anything. Nothing depends on the directory existing — every `PhotosDir` use site
 either creates it (`media.MkdirAll`, `apps/server/internal/httpapi/photos.go:42`,
-`apps/server/internal/media/photos.go:104`) or tolerates its absence
+`apps/server/internal/media/photos.go:98`) or tolerates its absence
 (`os.Remove`, `os.RemoveAll` in `httpapi/me.go:226-235`).
 
 The image builds `install -d -o 10001 -g 10001 /data/photos`, but `./data` is a
@@ -1561,7 +1568,7 @@ api-1  | 2026/10/14 22:15:20 POST /v1/auth/otp/start 200 309ms
 
 `auth.otp` is `{"v":true}` here, so this is a real send, not a skipped one. That
 flag is the incident kill switch (`auth.go:156`); it is defaulted by migration
-`0008_default_flags.sql:8`, which exists precisely because `seed` writes only
+`0008_default_flags.sql:9`, which exists precisely because `seed` writes only
 `auth.public_signup` (`seed.go:143`). Expect this line on a VPS with a wrong
 `TWILIO_ACCOUNT_SID`.
 
@@ -2136,6 +2143,17 @@ drwxr-x--- 1 10001    10001          144 Oct 14 22:49 photos.pre-restore
 **6 live, 5 in the snapshot.** That difference is the loss the drill is built
 around.
 
+Record the snapshot's own count before touching anything — the comparison at
+the end is against *this*, not against the live database:
+
+```bash
+STAMP=backups/gamematch-20261014T222905Z.db
+sqlite3 "$STAMP" 'PRAGMA integrity_check;'                  # ok
+sqlite3 "$STAMP" 'SELECT count(*) FROM users;' > /tmp/before.txt
+cat /tmp/before.txt                                        # 5
+```
+
+
 `mv /d/photos /d/photos.pre-restore` is there for the same reason the database is
 moved aside: extracting the archive over a live `data/photos` leaves every
 photo directory uploaded **after** the snapshot sitting there, orphaned from a
@@ -2182,10 +2200,10 @@ gamematch-api-1   gamematch-api:latest   "/usr/local/bin/game…"   api       Ab
 $ curl -sk -o /dev/null -w '%{http_code}\n' https://localhost/v1/healthz
 200
 
-$ sqlite3 data/gamematch.db 'SELECT count(*) FROM users;' > /tmp/opencode/after.txt
-$ cat /tmp/opencode/after.txt
+$ sqlite3 data/gamematch.db 'SELECT count(*) FROM users;' > /tmp/after.txt
+$ cat /tmp/after.txt
 5
-$ diff /tmp/opencode/before.txt /tmp/opencode/after.txt && echo "restore verified"
+$ diff /tmp/before.txt /tmp/after.txt && echo "restore verified"
 restore verified
 ```
 
@@ -2265,9 +2283,12 @@ $ ls -ln backups/
 -rw-r--r-- 1    0    0     0 Oct 14 22:49 gamematch-20261014T224853Z.db-wal
 ```
 
-That is 32 KiB per snapshot — roughly 46 MB a year at four runs a day — and
-neither name matched `scripts/backup.sh`'s prune, so they used to accumulate for
-the life of a deployment. `backup.sh` now sweeps them, and **the rule is
+That is 32 KiB per snapshot, and neither name matched `scripts/backup.sh`'s
+prune. A scheduled run does **not** leave them behind — `.backup` writes into
+the run's scratch directory, the verification reads the scratch copy, and the
+`EXIT` trap removes it — so this only happens when a person or a drill reads a
+*published* snapshot. That makes it an operator-created cost rather than a
+background leak, but it still accumulated for the life of a deployment. `backup.sh` now sweeps them, and **the rule is
 "orphaned", not "old"**: a sidecar is removed only when the `.db` it belongs to
 is gone. A sidecar whose snapshot still exists survives no matter how old, because
 that snapshot may be being read right now.

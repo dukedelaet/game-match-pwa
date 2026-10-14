@@ -138,8 +138,12 @@ find "$BACKUP_DIR" -name 'photos-*.tar.gz' -mtime +14 -delete
 # Reading a snapshot with sqlite3 leaves gamematch-<stamp>.db-shm (32K) and
 # .db-wal (0) beside it -- even with mode=ro, because a WAL database's index
 # lives in the shared-memory file. The two finds above match neither name, so
-# before this sweep those accumulated for the life of a deployment: ~46MB/year
-# across four runs a day, unbounded.
+# before this sweep those accumulated for the life of a deployment.
+#
+# A scheduled run leaves none: .backup writes into the run's scratch directory,
+# the verification reads that copy, and the EXIT trap removes it. These appear
+# when someone reads a PUBLISHED snapshot - a drill, a manual inspection - and
+# each such read costs 32 KiB for as long as the deployment lives.
 #
 # The rule is ORPHANED, not OLD. A sidecar whose .db is still present belongs
 # to a snapshot that exists and may be being read right now, and it survives

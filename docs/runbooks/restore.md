@@ -246,14 +246,23 @@ A restore that reports the right row counts is a restore that copied a file. To
 check it rolled back to the right point in time, compare against what the live
 database held immediately before:
 
+Record it before anything is moved:
+
+```bash
+sqlite3 "$STAMP" 'SELECT count(*) FROM users;' > /tmp/before.txt
 ```
-$ sqlite3 data/gamematch.db 'SELECT count(*) FROM users;'    # after the restore
+
+Then, after the restore:
+
+```
+$ sqlite3 data/gamematch.db 'SELECT count(*) FROM users;' > /tmp/after.txt
+$ cat /tmp/after.txt
 5
 $ diff /tmp/before.txt /tmp/after.txt && echo "restore verified"
 restore verified
 ```
 
-`/tmp/before.txt` was `SELECT count(*) FROM users;` against the **snapshot**,
+`/tmp/before.txt` is `SELECT count(*) FROM users;` against the **snapshot**,
 taken before anything was moved. A user that exists in the live database but not
 in the snapshot should be **absent** afterwards — that is the proof the restore
 took effect rather than silently doing nothing.

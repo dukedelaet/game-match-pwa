@@ -73,8 +73,10 @@ Set these (Caddy reads them from its own environment or the `{env.*}` block):
 
 | Variable | Meaning |
 | --- | --- |
-| `GAMEMATCH_SITE` | Public hostname. A real domain gets automatic HTTPS; unset serves plain HTTP on `:80`; `localhost` uses Caddy's internal CA. |
-| `GAMEMATCH_ROOT` | Absolute path to `apps/web/dist`. |
+| `GAMEMATCH_SITE` | Public hostname. A real domain gets an automatic certificate; the default, `localhost`, serves HTTPS on `:443` with Caddy's internal CA. **There is no plain-HTTP mode.** |
+| `GAMEMATCH_ROOT` | Absolute path to `apps/web/dist`. Default `/srv/dist`. Must be absolute — a relative path resolves against the working directory and every asset 404s while `/v1/healthz` still returns 200. |
+| `GAMEMATCH_API` | Address the API is proxied to. Default `127.0.0.1:8000`, correct on a host; the Compose stack sets `api:8000`. |
+| `GAMEMATCH_LOG_DIR` | Directory for the access log. Default `/var/log/caddy`. Caddy creates it if absent, but it must be writable by the Caddy user. |
 
 ```bash
 sudo systemctl reload caddy

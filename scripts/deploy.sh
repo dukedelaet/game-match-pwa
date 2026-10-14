@@ -41,7 +41,7 @@ Operator steps (once per host):
 
   4. point Caddy at the built PWA
        sudo cp deploy/Caddyfile /etc/caddy/Caddyfile
-       sudoedit /etc/caddy/Caddyfile      # set GAMEMATCH_SITE and GAMEMATCH_ROOT
+       sudoedit /etc/caddy/Caddyfile      # set GAMEMATCH_SITE, GAMEMATCH_ROOT, GAMEMATCH_API and GAMEMATCH_LOG_DIR
        sudo systemctl reload caddy
 
   5. verify

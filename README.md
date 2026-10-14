@@ -30,7 +30,25 @@ Demo accounts (code **123456**):
 
 - `apps/web` — Vite + React 19 PWA (TanStack Router, Zustand, Tailwind)
 - `apps/server` — Go `/v1` API over SQLite (`cmd/gamematch` serves; pass `seed` to seed)
+- `docker-compose.yml` — the supported deployment: API, Caddy-served PWA, backups
 - `docs/` — design spec and business proposal
+
+## Deploy
+
+**[`docs/runbooks/deploy-docker.md`](docs/runbooks/deploy-docker.md)** — the
+supported path. One `docker compose up --build -d` brings up the API, the PWA
+behind Caddy with automatic HTTPS, and a scheduled backup; the same file covers
+a VPS and a local machine, which differ only in `.env`.
+
+Build the PWA before the first image build — the `web` image copies
+`apps/web/dist` rather than building it:
+
+```bash
+pnpm --filter web build
+```
+
+`docs/runbooks/deploy.md` is the older systemd path, kept for hosts already
+running it.
 
 ## API
 

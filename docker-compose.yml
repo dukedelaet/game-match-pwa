@@ -178,10 +178,17 @@ services:
       # directory holding at most ~56 files; the frequency costs nothing.
       interval: 60s
       timeout: 10s
-      # Docker runs the first health check IMMEDIATELY at container start, not
-      # one `interval` in. So a start period shorter than the interval would
-      # still suppress checks, and 180s is deliberately longer than the 60s
-      # interval to give the whole startup path room to produce a first result.
+      # Measured on Docker Engine 29.7.2, not assumed: the first probe lands
+      # ~5s after the container starts, and during `start_period` the daemon
+      # keeps probing at that ~5s cadence rather than at `interval`, switching
+      # to 60s only once the start period expires. So the start period buys
+      # three minutes of grace at five-second granularity, covering the sleep
+      # above, apk add, and a first backup.
+      #
+      # A corollary worth stating, because the obvious reasoning about it is
+      # wrong: a start period SHORTER than the interval would not suppress
+      # anything. With start_period=5s the first probe still fires at ~5.75s.
+      # `interval` never governs the cadence while the start period is open.
       #
       # It buys three minutes of grace from container start, covering the sleep
       # above, apk add, and a first backup. That is enough for the databases

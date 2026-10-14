@@ -34,7 +34,9 @@ Five input classes the spec implies that no task's tests exercise. Each gets a t
 
 ### Task 1: Fix `deploy/Caddyfile`
 
-The shipped Caddyfile has four defects, all verified in the audit, and it **panics Caddy on startup** when `/var/log/caddy` does not exist. Doing this first means the container work in later tasks inherits a working proxy, and #95/#96 stop being separate half-finished work.
+The shipped Caddyfile has four defects, all verified in the audit, and it left the access log's directory unbound, so `output file` had nowhere to
+write. (**Falsified later:** Caddy 2.10.2 creates the directory itself and does
+not panic — the fix is still right, the stated failure mode was not.) Doing this first means the container work in later tasks inherits a working proxy, and #95/#96 stop being separate half-finished work.
 
 **Files:**
 - Create: `deploy/caddy-verify.sh` — verification harness
@@ -94,7 +96,8 @@ if [ ! -f "$WORKDIR/index.html" ]; then
   exit 1
 fi
 
-# A log directory must exist: Caddy panics on startup if the directory for
+# A log directory must exist and be writable. (Caddy 2.10.2 does create it if
+# missing; the defect was that nothing bound it.)
 # `output file` does not, rather than reporting a usable error.
 rm -rf "$LOGDIR"; mkdir -p "$LOGDIR"
 mkdir -p "$ROOT/.caddytest"
@@ -169,7 +172,7 @@ directory, which for the packaged unit is /, so every static asset 404'd
 while the API health check still passed. The @shell cache matcher was an
 exact-match allowlist of four paths, so the PWA's own start_url /boot was
 served uncached and returning users could hold a stale index.html. The
-access log had no rotation, and Caddy panics on startup rather than
+access log had no rotation, and nothing bounds it rather than
 reporting a usable error when the log directory does not exist.
 
 Adds the security headers the audit found missing, and a verification
@@ -213,7 +216,9 @@ Set `ENTRYPOINT ["/usr/local/bin/gamematch"]`, not `CMD`: the binary is the prog
 
 - [ ] **Step 4: Create `.dockerignore`**
 
-Exclude `node_modules`, `.git`, `apps/web/dist`, `apps/server/data`, `data`, `backups`, `.env`, `*.log`, and `docs`. Without this, a stray `node_modules` can reach the build context and the API image becomes enormous.
+Exclude `node_modules`, `.git`, `apps/server/data`, `data`, `backups`, `.env`, `*.log`, and `docs`. Without this, a stray `node_modules` can reach the build context and the API image becomes enormous.
+
+**`apps/web/dist` is deliberately NOT excluded** — it is the web image's only build input, since that image builds nothing and copies the host-built PWA. Excluding it makes the web build fail outright. (Corrected in Task 2.)
 
 - [ ] **Step 5: Extend `.gitignore`**
 
@@ -269,7 +274,7 @@ Beware: the image's `ENV ADDR=0.0.0.0:8000` is overridden by compose `environmen
 
 - [ ] **Step 2: Create `.env.example`**
 
-Both configurations in one file, with the production section uncommented-by-default and a clearly marked local section:
+Both configurations in one file. It ships with the **local** block active and the VPS block commented, because the common case is a local run and the VPS operator has to supply real credentials either way. The VPS block must be uncommented with the exception of `DEV_OTP`:
 
 ```
 # --- local (APP_ENV=local) ---
@@ -288,7 +293,7 @@ DEV_OTP=123456
 # TURNSTILE_SECRET=
 ```
 
-`DEV_OTP` is commented rather than empty in the local block because it must be *absent* in production — `Config.Validate()` rejects it there, and a blank line would read as present.
+`DEV_OTP` is uncommented and set in the local block (`DEV_OTP=123456`), and stays commented in the VPS block. It must be *absent or empty* in production — `Config.Validate()` rejects a non-empty value there, and `getenv` treats blank as unset, so `DEV_OTP=` would also be accepted. (Corrected in Task 6: the plan's `sed` initially left the local line in place and the API refused to boot.)
 
 - [ ] **Step 3: Verify compose resolves**
 
@@ -733,20 +738,24 @@ an older snapshot must visibly *lose* the rows written after it.
 docker compose stop api
 STAMP=backups/gamematch-<older-stamp>.db
 sqlite3 "$STAMP" 'PRAGMA integrity_check;'                      # ok
-sqlite3 "$STAMP" 'SELECT count(*) FROM users;' > /tmp/opencode/before.txt
+sqlite3 "$STAMP" 'SELECT count(*) FROM users;' > /tmp/before.txt
 sudo mv data/gamematch.db data/gamematch.db.pre-restore
 sudo rm -f data/gamematch.db-wal data/gamematch.db-shm
 sudo cp "$STAMP" data/gamematch.db
 # GUARDED: data/photos is absent on a fresh stack, so the archive is
 # legitimately missing and an unconditional tar exits 2 AFTER the database
 # has already been replaced. See "Five things" below.
-[ -f "backups/photos-<stamp>.tar.gz" ] && sudo tar xzf "backups/photos-<stamp>.tar.gz" -C data
+if [ -f "backups/photos-<stamp>.tar.gz" ]; then     # absent on a fresh stack
+    sudo tar xzf "backups/photos-<stamp>.tar.gz" -C data
+else
+    echo "no photos archive for <stamp>"
+fi
 sudo chown -R 10001:10001 data
 docker compose start api
 sleep 4
 curl -sk -o /dev/null -w '%{http_code}\n' https://localhost/v1/healthz
-sqlite3 data/gamematch.db 'SELECT count(*) FROM users;' > /tmp/opencode/after.txt
-diff /tmp/opencode/before.txt /tmp/opencode/after.txt && echo "restore verified"
+sqlite3 data/gamematch.db 'SELECT count(*) FROM users;' > /tmp/after.txt
+diff /tmp/before.txt /tmp/after.txt && echo "restore verified"
 sudo rm -rf data/gamematch.db.pre-restore data/photos.pre-restore   # once verified
 ```
 
