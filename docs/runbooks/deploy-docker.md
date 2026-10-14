@@ -9,8 +9,12 @@
 ## Verified on local Docker
 
 Recorded on a local machine on 2026-10-14, against the stack as committed at
-this point in the plan (Tasks 1–4). Everything below is the real terminal
-output, unedited, with the real numbers.
+this point in the plan (Tasks 1–4). Every command below was run against the live
+stack, and every value in the output blocks is the real one — no number, header,
+status, path or count has been altered. A few blocks are trimmed to the part
+that matters; §1 drops some `Volume … Created` lines, §7(b) drops the `curl`
+line and the two `sqlite3` subshell traces, and `cat jar` omits curl's three
+comment lines. Each trimmed block says so.
 
 Two things about how to read it:
 
@@ -23,13 +27,47 @@ Two things about how to read it:
 ### Prerequisites
 
 ```bash
-cp .env.example .env          # APP_ENV=local in the local block
+pnpm install
+pnpm --filter web build        # REQUIRED — see below
+cp .env.example .env           # APP_ENV=local in the local block
 mkdir -p data backups
 sudo chown -R 10001:10001 data
 ```
 
-`sudo` needs a password, so `./data` was made uid 10001 with a throwaway
-container instead — same result, no host credential:
+**The PWA build is not optional.** `apps/web/Dockerfile:21` is
+`COPY apps/web/dist/ /srv/dist/` and the web image builds nothing — it copies
+prebuilt output. `apps/web/dist` is gitignored, so on a fresh clone it does not
+exist and the build fails:
+
+```
+$ docker compose build web          # apps/web/dist moved aside = fresh clone
+#9 ERROR: failed to calculate checksum of ref ttzdq1zuskb4fffb3vjrx7fvr::k5yikmgyagrsntt5zt60fxwg9: "/apps/web/dist": not found
+------
+ > [2/3] COPY apps/web/dist/ /srv/dist/:
+------
+Dockerfile:21
+failed to solve: failed to compute cache key: failed to calculate checksum of ref ttzdq1zuskb4fffb3vjrx7fvr::k5yikmgyagrsntt5zt60fxwg9: "/apps/web/dist": not found
+```
+
+`pnpm --filter web build` from that same state:
+
+```
+$ pnpm --filter web build
+dist/assets/index-CdqkamKB.css   20.81 kB │ gzip:  4.61 kB
+dist/assets/index-DOzqftFo.js   301.71 kB │ gzip: 94.47 kB
+
+✓ built in 200ms
+PWA v1.3.0
+mode      generateSW
+precache  12 entries (331.50 KiB)
+files generated
+  dist/sw.js
+  dist/workbox-2fbc6a65.js
+```
+
+**On `./data` ownership:** `sudo` needs a password on the machine this was
+recorded on, so `./data` was made uid 10001 with a throwaway root container
+instead — same result, no host credential. Use whichever you have:
 
 ```bash
 mkdir -p data backups
@@ -43,6 +81,9 @@ docker compose up -d --build
 docker compose run --rm api seed
 docker compose ps
 ```
+
+`up` output, tail — the build steps and the two `Volume gamematch_caddy-data
+Created` lines are dropped, nothing else:
 
 ```
  Volume gamematch_caddy-logs Created 
@@ -137,7 +178,8 @@ $ for ip in 10.194.1.28 100.85.246.117 172.17.0.1 172.18.0.1 172.19.0.1 172.20.0
 172.20.0.1       000
 ```
 
-(wlp0s20f0u1i2, tailscale0, incusbr0, docker0 and the three compose bridges.)
+(wlp0s20f0u1i2, tailscale0, docker0 and the three compose bridges: 172.17, 172.18,
+172.19, 172.20 — six addresses, each refused.) `incusbr0` was not in the loop.
 
 ### Step 3 — the shipped relative-root default is not in use
 
@@ -156,6 +198,15 @@ $ docker compose exec web sh -c 'ls /srv/dist/index.html'
 
 $ curl -sk -o /dev/null -w '%{http_code}\n' https://localhost/assets/index-DOzqftFo.js
 200
+```
+
+The asset name is read from the **host's** `apps/web/dist/assets`, which is the
+tree the web image was built from — the running container serves
+`/srv/dist/assets/index-DOzqftFo.js`. Reading it inside the container instead
+would make the check independent of what is on the host:
+
+```bash
+docker compose exec web sh -c 'ls /srv/dist/assets' | grep -m1 '\.js$'
 ```
 
 ### Step 4 — the proxy reaches the API
@@ -212,12 +263,12 @@ One occurrence each.
 
 ### Step 7 — data survives a restart
 
-The plan's step 7 does not run as written. Two of its three queries name
-columns the schema does not have, and the last one asserts something that is
-false on the day of a first sign-in. All three corrections are below, with the
-literal failure first.
+The plan's step 7 does not run as written, and **the worst version of it passes
+silently**. One query names a column the schema does not have and dies; the
+last one is a tautology that exits 0 while asserting nothing. Both are corrected
+below, with the literal behaviour of each shown first.
 
-**(a) The plan's queries, verbatim — fails:**
+#### (a) `otp_codes` is keyed on `phone`, not `phone_e164` — this one errors
 
 ```bash
 CODE="$(sqlite3 data/gamematch.db "SELECT code FROM otp_codes WHERE phone_e164 = '+15551239999';")"
@@ -230,8 +281,6 @@ Parse error in 2nd command line argument: no such column: phone_e164
 could not read the local OTP; is APP_ENV=local?
 ```
 
-`otp_codes` is keyed on `phone`, not `phone_e164`:
-
 ```bash
 $ sqlite3 data/gamematch.db ".schema otp_codes"
 CREATE TABLE otp_codes (
@@ -241,8 +290,20 @@ CREATE TABLE otp_codes (
 );
 ```
 
-The plan's last query has the same problem — `user_private` has no
-`phone_e164_hash`; `users` does, and the two join on `user_id`:
+The step then exits 1 with a message blaming `APP_ENV`, which is set correctly.
+Its `test -n "$CODE"` guard also sits *after* the verify call that spends the
+code, so an unreadable OTP is only detected after it has been consumed — and
+`store.TakeOTP` (`apps/server/internal/store/auth.go:73`) deletes the row as it
+reads it, so the row is gone either way.
+
+#### (b) The last query is a tautology — this one silently passes
+
+```sql
+SELECT name FROM users WHERE phone_e164_hash =
+    (SELECT phone_e164_hash FROM user_private WHERE phone_e164 = '+15551239999');
+```
+
+`user_private` has no `phone_e164_hash` column:
 
 ```bash
 $ sqlite3 data/gamematch.db ".schema user_private"
@@ -254,65 +315,199 @@ CREATE TABLE user_private (
 );
 ```
 
-One more wart in the same step: `test -n "$CODE"` comes *after* the verify call
-that consumes `$CODE`, so an unreadable OTP is only detected after it has
-already been spent.
+SQLite resolves an unqualified name innermost-first, so the inner
+`phone_e164_hash` does **not** fail — it binds to the outer `users` table. The
+subquery becomes *correlated*, and the predicate degenerates to
+`users.phone_e164_hash = users.phone_e164_hash`. It is always true (and NULL for
+a NULL hash), so it selects **every user with a non-null hash**:
 
-**(b) Corrected, and passing.** The assert moved before its use, and the user is
-identified by id rather than by name — signing in creates the row but does not
-set a name, so a fresh user has `name IS NULL` and the plan's "printing a name"
-cannot hold on the day of a first sign-in:
+```
+$ sqlite3 data/gamematch.db "SELECT name FROM users WHERE phone_e164_hash = (SELECT phone_e164_hash FROM user_private WHERE phone_e164 = '+15551239999');"
+Alex
+Jordan
+Staff
+                      <- the new user's NULL name, printed as a blank line
+$ echo $?
+0
+```
+
+Four rows returned, and:
+
+```
+$ sqlite3 data/gamematch.db "SELECT count(*) FROM users WHERE phone_e164_hash IS NOT NULL;"
+4
+```
+
+The result is *all four* non-null-hash users — the predicate is a no-op. The
+plan's stated expectation is "the last query printing a name", so `Alex` and
+`Jordan` satisfy it and the step reports success **while proving nothing about
+the user that just signed in**. That is the same silent-pass as the count
+assertion it was written to fix.
+
+The blank fourth line is not a missing name in the output — it *is* the new
+user's `name`, which is genuinely NULL: `httpapi/auth.go:192-198` creates the
+row with no `Name`, and `store/users.go:80-89` defaults it to
+`status=pending, onboarding_step=intent`. Use `quote(u.name)` so NULL is visible
+rather than looking like missing output.
+
+#### (c) The corrected step — asserts, and proves *that* user
+
+This is the script the plan now carries, verbatim:
 
 ```bash
-set -x   # so the trace below shows which value each step actually used
+#!/usr/bin/env bash
+set -euo pipefail
+PHONE='+15551239999'
+
+# otp/start enforces its rate limits SILENTLY (auth.go:120-125): over the limit
+# it still answers {"ok":true} and stores nothing. With APP_DEBUG=true a code
+# that was issued comes back as devCode, so an absent devCode means the limit
+# was hit -- not that APP_ENV is wrong. Limits are 5/IP and 3/phone per 15m and
+# are PERSISTED in rate_limits, so restarting api does not clear them.
+curl -sk -X POST https://localhost/v1/auth/otp/start  -d "{\"phone\":\"$PHONE\"}" -o /dev/null
+CODE="$(sqlite3 data/gamematch.db "SELECT code FROM otp_codes WHERE phone = '$PHONE';")"
+test -n "$CODE" || { echo "could not read the OTP: APP_ENV=local, or the otp/start rate limit was hit"; exit 1; }
+curl -sk -X POST https://localhost/v1/auth/otp/verify -d "{\"phone\":\"$PHONE\",\"code\":\"$CODE\"}" -o /dev/null
+
+# Assert BEFORE restarting, so a sign-in that created nothing is not mistaken
+# for a row lost across the restart.
+ID_BEFORE="$(sqlite3 data/gamematch.db "SELECT u.id FROM users u JOIN user_private p ON p.user_id = u.id WHERE p.phone_e164 = '$PHONE';")"
+CREATED="$(sqlite3 data/gamematch.db "SELECT created_at FROM users WHERE id = '$ID_BEFORE';")"
+test -n "$ID_BEFORE" || { echo "FAIL: signing in created no user row"; exit 1; }
+
 BEFORE="$(sqlite3 data/gamematch.db 'SELECT count(*) FROM users;')"
-
-curl -sk -X POST https://localhost/v1/auth/otp/start  -d '{"phone":"+15551239999"}' -o /dev/null
-CODE="$(sqlite3 data/gamematch.db "SELECT code FROM otp_codes WHERE phone = '+15551239999';")"
-test -n "$CODE" || { echo "could not read the local OTP; is APP_ENV=local?"; exit 1; }
-curl -sk -X POST https://localhost/v1/auth/otp/verify -d "{\"phone\":\"+15551239999\",\"code\":\"$CODE\"}" -o /dev/null
-
 docker compose restart api
 AFTER="$(sqlite3 data/gamematch.db 'SELECT count(*) FROM users;')"
 printf 'before=%s after=%s\n' "$BEFORE" "$AFTER"
-test "$AFTER" -gt "$BEFORE" || { echo "FAIL: the user did not survive the restart"; exit 1; }
+
+# -ge, not -gt: a re-run signs in an already-registered number, creates no row,
+# and counts equal. With -gt that re-run fails claiming a user was lost.
+test "$AFTER" -ge "$BEFORE" || { echo "FAIL: users went missing across the restart"; exit 1; }
+
+ID_AFTER="$(sqlite3 data/gamematch.db "SELECT u.id FROM users u JOIN user_private p ON p.user_id = u.id WHERE p.phone_e164 = '$PHONE';")"
+CREATED_AFTER="$(sqlite3 data/gamematch.db "SELECT created_at FROM users WHERE id = '$ID_AFTER';")"
+test "$ID_AFTER" = "$ID_BEFORE"    || { echo "FAIL: a different user is there after the restart"; exit 1; }
+test "$CREATED_AFTER" = "$CREATED" || { echo "FAIL: the row was replaced, not preserved"; exit 1; }
+
+echo "same row survived: id=$ID_AFTER created_at=$CREATED_AFTER"
+sqlite3 data/gamematch.db "SELECT u.id, quote(u.name), u.status, u.created_at FROM users u JOIN user_private p ON p.user_id = u.id WHERE p.phone_e164 = '$PHONE';"
+
+# The check has to be able to say "no": same query, a phone that never signed in
+# returns zero rows. The tautological version returns every user with a hash.
+test -z "$(sqlite3 data/gamematch.db "SELECT u.id FROM users u JOIN user_private p ON p.user_id = u.id WHERE p.phone_e164 = '+15559990000';")" \
+  || { echo "FAIL: the query matched a phone that never signed in"; exit 1; }
+
+sqlite3 data/gamematch.db 'PRAGMA journal_mode;'
 ```
 
-```
-+ BEFORE=4
-+ CODE=123456
-+ test -n 123456
-+ curl -sk -X POST https://localhost/v1/auth/otp/verify -d '{"phone":"+15551239999","code":"123456"}' -o /dev/null
-+ docker compose restart api
- Container gamematch-api-1 Restarting
- Container gamematch-api-1 Started
-+ AFTER=5
-+ printf 'before=%s after=%s\n' 4 5
-before=4 after=5
-+ test 5 -gt 4
-```
+Two things changed beyond the column names. The queries **join
+`user_private.user_id` to `users.id`**, so they return that one user or nothing —
+not every user with a hash. And the identity check asserts with `|| exit 1`
+rather than printing two lines for an operator to compare by eye: a count only
+proves *some* user row exists, while matching `id` *and* `created_at` across the
+restart proves the same row survived.
 
-The local OTP is `123456`, readable out of `./data` because `APP_ENV=local`.
-
-**(c) The same claim asserted by identity rather than by count.** A count going
-up proves *a* user exists after the restart; it does not prove it is the one
-that was created. Same row, same `created_at`, across the restart:
+Note the ordering. `$ID_BEFORE` is captured and asserted **immediately after
+the sign-in and before the restart**, so "the sign-in created a row" and "the row
+survived the restart" are two separate claims. `$BEFORE`/`$AFTER` straddle only
+the restart, so the count is purely a loss check — which is why it is `-ge`:
 
 ```
-user id=2c15e3d6-5dbd-40a0-a7f5-cdf8c1f282e9 created_at=2026-10-14T21:50:47.127419Z
-after restart: id=2c15e3d6-5dbd-40a0-a7f5-cdf8c1f282e9 created_at=2026-10-14T21:50:47.127419Z
-2c15e3d6-5dbd-40a0-a7f5-cdf8c1f282e9|pending|intent|2026-10-14T21:50:47.127419Z
-
-$ sqlite3 data/gamematch.db 'PRAGMA journal_mode;'
+$ bash step7.sh
+ Container gamematch-api-1 Restarting 
+ Container gamematch-api-1 Started 
+before=5 after=5
+same row survived: id=225ea504-68ce-4311-b1a4-79647bd89196 created_at=2026-10-14T22:05:10.453223Z
+225ea504-68ce-4311-b1a4-79647bd89196|NULL|pending|2026-10-14T22:05:10.453223Z
 wal
+$ echo $?
+0
 ```
 
-`journal_mode` is `wal`, so the restart above ran against a live WAL database on
-the bind mount — which is the point of the exercise. A host filesystem that
-cannot support WAL locking fails here rather than silently later.
+`quote(u.name)` prints `NULL` rather than an empty line, so the absent name is
+visible as what it is. `journal_mode` is `wal`, so the restart ran against a live
+WAL database on the bind mount — which is the point of the exercise. A host
+filesystem that cannot support WAL locking fails here rather than silently later.
 
-Signing in end to end through Caddy also works, opaque `HttpOnly` cookie and
-all:
+With the plan's original `-gt`, the same script re-run fails — the phone is now
+registered, so `verify` creates no row and the counts are equal:
+
+```
+$ bash step7.sh
+ Container gamematch-api-1 Restarting 
+ Container gamematch-api-1 Started 
+before=5 after=5
+FAIL: the user did not survive the restart
+$ echo $?
+1
+```
+
+— the step reporting a lost user when the only thing that happened is that the
+user already existed.
+
+#### (c2) `otp/start` fails silently once the rate limit is hit
+
+If `$CODE` comes back empty, the message to believe is **not** `is
+APP_ENV=local?`. `otp/start` enforces its limits silently
+(`apps/server/internal/httpapi/auth.go:120-125`): over the limit it answers
+`{"ok":true}`, stores nothing, and says nothing else — deliberately, so the
+endpoint cannot be used to probe which numbers exist. `APP_DEBUG=true` is what
+makes it detectable:
+
+```
+$ curl -sk -X POST https://localhost/v1/auth/otp/start -d '{"phone":"+15558887777"}'
+{"ok":true}            <- no devCode: the limit was hit, nothing was stored
+```
+
+With a code issued it is `{"devCode":"123456","ok":true}`. The absence of
+`devCode` *is* the signal.
+
+The limits are `limitOTPStartPerIP = 5` and `limitOTPStartPerPhone = 3` per
+`windowOTP = 15m` (`apps/server/internal/httpapi/ratelimit.go:17-20`), and they
+are **persisted**, so `docker compose restart api` does not clear them:
+
+```
+$ sqlite3 data/gamematch.db "SELECT bucket, count, window_start FROM rate_limits WHERE bucket LIKE 'otp:start%';"
+otp:start:ip:4be83b3115428950|8|1792015247510
+otp:start:phone:834fa3a38e93d341|3|1792015247510
+otp:start:phone:c2841877bd1ad1e3|1|1792015264042
+otp:start:phone:aab263b3e25bbc25|1|1792015347103
+```
+
+8 against a limit of 5. So Step 7 is only reliably runnable a few times per
+15 minutes per host, and its failure message blames the wrong thing. Run it with
+a number that has not just been used, or wait the window out. On the VPS this is
+not a nuisance: it is the same limit that protects Twilio from being burned, and
+it is per IP.
+
+#### (d) The corrected query has to be able to say "no"
+
+A check that always returns a row proves nothing either. Same query, same
+`JOIN`, for a phone that never signed in:
+
+```
+$ sqlite3 data/gamematch.db "SELECT u.id FROM users u JOIN user_private p ON p.user_id = u.id WHERE p.phone_e164 = '+15559990000';"
+$ echo $?
+0
+```
+
+No rows, exit 0 — and `test -n "$ID_BEFORE"` in (c) turns that into a failure.
+The tautological version in (b) returns four rows for the same input.
+
+The seeded users, for reference — `seed` creates **four** named users, and `House`
+is the only one with a NULL `phone_e164_hash`, which is why the tautological
+query drops it:
+
+```
+$ sqlite3 data/gamematch.db "SELECT id, quote(name), phone_e164_hash, status FROM users;"
+00000000-0000-4000-8000-000000000001|'House'||active
+11111111-1111-4111-8111-111111111130|'Alex'|f5be76815beedc12461645e4a6cf4b031c879dc3758b0b22ffd0fa340c3b9617|active
+11111111-1111-4111-8111-111111111131|'Jordan'|3d1ac597aabc6ca5374ca51447cbf3b40c439d3b57cde65f056290a465f7b4b|active
+11111111-1111-4111-8111-111111111132|'Staff'|8aacb9d76d462f5c90d90a857456693f1deab0bd053ffcca96ca7d2f77b2badd|active
+```
+
+Signing in end to end through Caddy also works, opaque `HttpOnly` cookie and all
+(`cat jar` trimmed to the cookie line — curl writes three comment lines above it):
 
 ```
 $ curl -sk -c jar -X POST https://localhost/v1/auth/otp/start -d '{"phone":"+15557776666"}'
@@ -351,8 +546,9 @@ $ docker compose exec api ls -ldn /data
 drwxr-xr-x    1 10001    10001          100 Oct 14 21:51 /data
 ```
 
-**`data/photos` does not exist on a fresh stack, and the plan's command fails
-on it.** Immediately after a first `up` and `seed`:
+**`data/photos` does not exist on a fresh stack**, so the plan's
+`ls -ld data data/photos` errors on the second path. Immediately after a first
+`up` and `seed`:
 
 ```
 $ ls -ld data data/photos
@@ -360,59 +556,93 @@ ls: cannot access 'data/photos': No such file or directory
 drwxr-xr-x 1 10001 10001 88 Oct 14 14:51 data
 ```
 
+On a genuinely fresh install that is **benign**: there are no photos to lose,
+and the first backup runs ~35s after `up`, long before anyone can upload
+anything. Nothing depends on the directory existing — every `PhotosDir` use site
+either creates it (`media.MkdirAll`, `apps/server/internal/httpapi/photos.go:42`,
+104) or tolerates its absence (`os.Remove`, `os.RemoveAll` in
+`httpapi/me.go:226-235`).
+
 The image builds `install -d -o 10001 -g 10001 /data/photos`, but `./data` is a
 bind mount, so the host directory shadows the image's `/data` and takes the
-`photos` subdirectory with it. It is created on demand instead, by the upload
-handler's `media.MkdirAll` (`apps/server/internal/httpapi/photos.go:42`). Uploading
-one photo through the stack creates it, owned by 10001:
+`photos` subdirectory with it. That image line buys nothing and is worth knowing
+about. The directory is created on the first upload, owned by 10001:
 
 ```
 $ curl -sk -b jar -X POST https://localhost/v1/me/photos \
     -F "photo=@apps/web/dist/icons/icon-192.png;type=image/png"
-{"photo":{"id":"4002089b-d1ad-4e9d-a32e-9d22d8e7e160","url":"/v1/photos/4002089b-d1ad-4e9d-a32e-9d22d8e7e160","state":"ok"}}
+{"photo":{"id":"b065faa9-cd1d-4df4-85fc-390f68c06159","url":"/v1/photos/b065faa9-cd1d-4df4-85fc-390f68c06159","state":"ok"}}
+
+$ sqlite3 data/gamematch.db "SELECT id, path FROM photos;"
+b065faa9-cd1d-4df4-85fc-390f68c06159|c9454cc0-f98b-4767-8d45-071aa8b4e327/b065faa9-cd1d-4df4-85fc-390f68c06159.jpg
 
 $ ls -ld data data/photos
-drwxr-xr-x 1 10001 10001 100 Oct 14 14:51 data
-drwxr-x--- 1 10001 10001  72 Oct 14 14:51 data/photos
+drwxr-xr-x 1 10001 10001 100 Oct 14 15:01 data
+drwxr-x--- 1 10001 10001  72 Oct 14 15:01 data/photos
 ```
 
-So the ownership property holds, but the plan's `ls -ld data data/photos` check
-is a false alarm on a fresh install. Note the mode: `0750`, so the host user
-cannot `find data/photos` — that is `media.dirPerm` by design, not a
-permissions bug.
+So the ownership property the step protects holds. Note the mode: `0750`, so the
+host user cannot `find data/photos` without sudo — that is `media.dirPerm`
+(`apps/server/internal/media/photos.go:93`) by design, not a permissions bug.
 
-The same absence has a visible effect on backups. `scripts/backup.sh` guards the
-archive with `if [ -d "$DATA_DIR/photos" ]`, so the first backup of a fresh
-install is database-only:
+#### The real exposure: a missing photos directory is skipped in silence
 
-```
-$ ls -la backups/
-total 504
-drwxr-xr-x 1 duke duke     58 Oct 14 14:50 .
-drwxr-xr-x 1 duke duke    438 Oct 14 14:49 ..
--rw-r--r-- 1 root root 516096 Oct 14 14:50 gamematch-20261014T215031Z.db
-
-$ docker compose run --rm --entrypoint sh backup \
-    -c "apk add --no-cache bash sqlite >/dev/null && /scripts/backup.sh /backups"
-backup: wrote /backups/gamematch-20261014T215152Z.db
-
-$ ls -la backups/
-total 1020
-drwxr-xr-x 1 duke duke    176 Oct 14 14:51 .
-drwxr-xr-x 1 duke duke    438 Oct 14 14:49 ..
--rw-r--r-- 1 root root 516096 Oct 14 14:50 gamematch-20261014T215031Z.db
--rw-r--r-- 1 root root 516096 Oct 14 14:51 gamematch-20261014T215152Z.db
--rw-r--r-- 1 root root  8988 Oct 14 14:51 photos-20261014T215152Z.tar.gz
-```
-
-The scheduled run reported:
+The fresh-install case is a false alarm in the verification step. This is not:
 
 ```
-$ docker compose logs --tail 12 backup
-backup-1  | backup: wrote /backups/gamematch-20261014T215031Z.db
+$ ls backups/                       # photos/ still present
+gamematch-20261014T220057Z.db
+gamematch-20261014T220112Z.db
+photos-20261014T220112Z.tar.gz
+
+# ... data/photos removed, while the database still holds the photo row ...
+$ sqlite3 data/gamematch.db "SELECT count(*) || ' photo rows' FROM photos;"
+1 photo rows
+
+$ docker compose run --rm --entrypoint sh backup -c "apk add --no-cache bash sqlite >/dev/null && /scripts/backup.sh /backups"
+backup: wrote /backups/gamematch-20261014T220127Z.db
+$ echo $?
+0
+
+$ ls backups/
+gamematch-20261014T220057Z.db
+gamematch-20261014T220112Z.db
+gamematch-20261014T220127Z.db
 ```
 
-and the container reached `healthy` on its own.
+The third `.db` — `220127Z`, taken with `data/photos` gone — has **no matching
+`photos-*.tar.gz`**, and nothing said so.
+
+`scripts/backup.sh:114` guards the archive with `if [ -d "$DATA_DIR/photos" ]`
+and otherwise does nothing at all — no warning, exit 0, a valid `.db` written
+and published as usual. And nothing else notices:
+
+```
+$ docker compose ps backup --format "table {{.Name}}\t{{.Status}}"
+NAME                 STATUS
+gamematch-backup-1   Up About a minute (healthy)
+
+$ docker compose logs --tail 5 backup
+backup-1  | backup: wrote /backups/gamematch-20261014T220057Z.db
+```
+
+The healthcheck only looks for a recent `gamematch-*.db`, so it stays `healthy`.
+If `data/photos` is ever lost — deleted, restored from the wrong place, left
+unmounted by a bind-mount typo — **every subsequent backup is silently
+database-only for six hours at a time**, indefinitely, with no signal anywhere.
+The database keeps its photo rows, so nothing in the app breaks either; the loss
+only surfaces at the point of recovery.
+
+That is the row for Task 7's troubleshooting table:
+
+> **No `photos-*.tar.gz` across several consecutive backups ⇒ the photos
+> directory is gone.** Check `ls -ld data/photos`. The script does not warn and
+> the backup container stays healthy; the only evidence is the absence of the
+> file in `./backups`.
+
+Note also that `./backups` files are owned by `root`, because the `backup`
+container runs as root and `./backups` is not remapped. Harmless while only that
+container writes there.
 
 One sharp edge on the manual path above: `--entrypoint sh` replaces the
 service's `command:`, which is where `apk add` lives. Dropping the `apk add`
@@ -484,8 +714,8 @@ $ docker compose exec web caddy adapt --config /etc/caddy/Caddyfile --pretty
 ```
 
 `roll_size_mb: 100`, `roll_keep: 10`, `roll_keep_days: 30` (720h). Note
-`"admin": {"disabled": true}` — `deploy/Caddyfile` turns the admin API off, so
-port 2019 in `docker compose ps` is the image's `EXPOSE` and nothing is
+`"admin": {"disabled": true}` — `deploy/Caddyfile:21` is `admin off`, so port
+2019 in `docker compose ps` is the base image's `EXPOSE` and nothing is
 listening:
 
 ```
@@ -493,5 +723,31 @@ $ docker compose exec web wget -qO- http://127.0.0.1:2019/config/
 wget: can't connect to remote host (127.0.0.1): Connection refused
 ```
 
-Use `caddy adapt` or `docker compose exec web caddy reload` rather than the admin
-API when reading or changing a running config.
+**`caddy reload` does not work on this stack**, and it is the obvious thing to
+reach for. It is implemented on top of the admin API:
+
+```
+$ docker compose exec web caddy reload --config /etc/caddy/Caddyfile
+{"level":"info","ts":1792015261.2054496,"msg":"using config from file","file":"/etc/caddy/Caddyfile"}
+{"level":"info","ts":1792015261.2066576,"msg":"adapted config to JSON","adapter":"caddyfile"}
+Error: sending configuration to instance: performing request: Post "http://localhost:2019/load": dial tcp [::1]:2019: connect: connection refused
+$ echo $?
+1
+```
+
+(Without `--config` it fails earlier still, with `Error: no config file to load`,
+because it looks for `./Caddyfile` in the working directory.)
+
+The two things that do work:
+
+```bash
+# read/validate the effective config, offline, without touching the running one
+docker compose exec web caddy adapt --config /etc/caddy/Caddyfile --pretty
+
+# apply a Caddyfile change: restart the container
+docker compose restart web
+```
+
+A `web` restart drops in-flight TLS connections; the service sets
+`stop_grace_period: 30s` so Caddy drains first, but a client mid-request at that
+moment is cut rather than finished.

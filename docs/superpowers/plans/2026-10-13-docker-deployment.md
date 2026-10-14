@@ -435,23 +435,83 @@ Expected: `1` for each.
 
 - [ ] **Step 7: Assert data survives a restart**
 
+Three things were wrong in the first draft of this step and were corrected
+against the real schema during execution. They are called out so the correction
+is not undone:
+
+1. `otp_codes` is keyed on `phone`, not `phone_e164` (`phone_e164` lives on
+   `user_private`), so the OTP query was a parse error.
+2. The final query did not error — it was worse. `user_private` has no
+   `phone_e164_hash`, so SQLite bound the inner name to the outer `users` table,
+   the subquery became correlated, and the predicate degenerated to
+   `users.phone_e164_hash = users.phone_e164_hash`. It returned every user with a
+   non-null hash and exited 0, so "printing a name" was satisfied by seeded
+   demo users while the step asserted nothing about the user that had just
+   signed in. Verified: the query returned 4 rows, which is exactly
+   `count(*) WHERE phone_e164_hash IS NOT NULL`.
+3. A freshly registered user has `name IS NULL` (`httpapi/auth.go:192-198`
+   creates no `Name`; `store/users.go:80-89` defaults `status=pending`), so a
+   bare `SELECT name` prints an empty line for it and looks like missing output.
+   `quote()` makes the NULL visible.
+
+The count is also a **loss** check, not the survival check — `after > before`
+proves only that some user row exists. The identity check below is the one that
+proves the right row survived, and it asserts rather than printing for eyeballs.
+
 ```bash
+#!/usr/bin/env bash
+set -euo pipefail
+PHONE='+15551239999'
+
+# otp/start enforces its rate limits SILENTLY (auth.go:120-125): over the limit
+# it still answers {"ok":true} and stores nothing. With APP_DEBUG=true a code
+# that was issued comes back as devCode, so an absent devCode means the limit
+# was hit -- not that APP_ENV is wrong. Limits are 5/IP and 3/phone per 15m and
+# are PERSISTED in rate_limits, so restarting api does not clear them.
+curl -sk -X POST https://localhost/v1/auth/otp/start  -d "{\"phone\":\"$PHONE\"}" -o /dev/null
+CODE="$(sqlite3 data/gamematch.db "SELECT code FROM otp_codes WHERE phone = '$PHONE';")"
+test -n "$CODE" || { echo "could not read the OTP: APP_ENV=local, or the otp/start rate limit was hit"; exit 1; }
+curl -sk -X POST https://localhost/v1/auth/otp/verify -d "{\"phone\":\"$PHONE\",\"code\":\"$CODE\"}" -o /dev/null
+
+# Assert BEFORE restarting, so a sign-in that created nothing is not mistaken
+# for a row lost across the restart.
+ID_BEFORE="$(sqlite3 data/gamematch.db "SELECT u.id FROM users u JOIN user_private p ON p.user_id = u.id WHERE p.phone_e164 = '$PHONE';")"
+CREATED="$(sqlite3 data/gamematch.db "SELECT created_at FROM users WHERE id = '$ID_BEFORE';")"
+test -n "$ID_BEFORE" || { echo "FAIL: signing in created no user row"; exit 1; }
+
 BEFORE="$(sqlite3 data/gamematch.db 'SELECT count(*) FROM users;')"
-
-# Sign in end to end, so a real user row exists to lose.
-curl -sk -X POST https://localhost/v1/auth/otp/start  -d '{"phone":"+15551239999"}' -o /dev/null
-CODE="$(sqlite3 data/gamematch.db "SELECT code FROM otp_codes WHERE phone_e164 = '+15551239999';")"
-curl -sk -X POST https://localhost/v1/auth/otp/verify -d "{\"phone\":\"+15551239999\",\"code\":\"$CODE\"}" -o /dev/null
-test -n "$CODE" || { echo "could not read the local OTP; is APP_ENV=local?"; exit 1; }
-
 docker compose restart api
 AFTER="$(sqlite3 data/gamematch.db 'SELECT count(*) FROM users;')"
 printf 'before=%s after=%s\n' "$BEFORE" "$AFTER"
-test "$AFTER" -gt "$BEFORE" || { echo "FAIL: the user did not survive the restart"; exit 1; }
-sqlite3 data/gamematch.db "SELECT name FROM users WHERE phone_e164_hash = (SELECT phone_e164_hash FROM user_private WHERE phone_e164 = '+15551239999');"
+
+# -ge, not -gt: a re-run signs in an already-registered number, creates no row,
+# and counts equal. With -gt that re-run fails claiming a user was lost.
+test "$AFTER" -ge "$BEFORE" || { echo "FAIL: users went missing across the restart"; exit 1; }
+
+ID_AFTER="$(sqlite3 data/gamematch.db "SELECT u.id FROM users u JOIN user_private p ON p.user_id = u.id WHERE p.phone_e164 = '$PHONE';")"
+CREATED_AFTER="$(sqlite3 data/gamematch.db "SELECT created_at FROM users WHERE id = '$ID_AFTER';")"
+test "$ID_AFTER" = "$ID_BEFORE"    || { echo "FAIL: a different user is there after the restart"; exit 1; }
+test "$CREATED_AFTER" = "$CREATED" || { echo "FAIL: the row was replaced, not preserved"; exit 1; }
+
+echo "same row survived: id=$ID_AFTER created_at=$CREATED_AFTER"
+sqlite3 data/gamematch.db "SELECT u.id, quote(u.name), u.status, u.created_at FROM users u JOIN user_private p ON p.user_id = u.id WHERE p.phone_e164 = '$PHONE';"
+
+# The check has to be able to say "no": same query, a phone that never signed in
+# returns zero rows. The tautological version returns every user with a hash.
+test -z "$(sqlite3 data/gamematch.db "SELECT u.id FROM users u JOIN user_private p ON p.user_id = u.id WHERE p.phone_e164 = '+15559990000';")" \
+  || { echo "FAIL: the query matched a phone that never signed in"; exit 1; }
+
+sqlite3 data/gamematch.db 'PRAGMA journal_mode;'
 ```
 
-Expected: `after` greater than `before`, and the last query printing a name. This proves the bind mount is the real state, and it exercises WAL locking — a filesystem that cannot support it fails right here. `APP_ENV=local` must be set or the OTP cannot be read, which is why the step asserts `$CODE` is non-empty rather than assuming it.
+Expected: `before`/`after` printed, `same row survived:`, one row for `$PHONE`
+with `quote(u.name)` showing `NULL`, and `wal`.
+
+This proves the bind mount is the real state, and it exercises WAL locking — a
+filesystem that cannot support it fails right here. `APP_ENV=local` must be set or
+the OTP cannot be read, which is why the step asserts `$CODE` is non-empty
+rather than assuming it — but an empty `$CODE` has a second cause, the silent
+rate limit, which is why the message names both.
 
 - [ ] **Step 8: Assert the data directory is host-owned, not root-owned**
 
