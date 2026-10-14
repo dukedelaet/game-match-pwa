@@ -145,7 +145,7 @@ services:
       - sh
       - -c
       - apk add --no-cache bash sqlite >/dev/null && sleep 30 && while true; do /scripts/backup.sh /backups; sleep 21600; done
-# The loop is built to survive failure, which means "container is Up" says
+    # The loop is built to survive failure, which means "container is Up" says
     # nothing about whether any backup has succeeded. A run that fails every
     # 6 hours leaves the service Up forever with nothing to show for it.
     # This check is the thing that turns that silence into a signal:
@@ -182,9 +182,10 @@ services:
       # directory holding at most ~56 files; the frequency costs nothing.
       interval: 60s
       timeout: 10s
-      # Docker runs the first check one `interval` in, so this must be LONGER
-      # than the interval to have any effect — a start-period shorter than the
-      # interval never suppresses a check, because none has run yet.
+      # Docker runs the first health check IMMEDIATELY at container start, not
+      # one `interval` in. So a start period shorter than the interval would
+      # still suppress checks, and 180s is deliberately longer than the 60s
+      # interval to give the whole startup path room to produce a first result.
       #
       # It buys three minutes of grace from container start, covering the sleep
       # above, apk add, and a first backup. That is enough for the databases

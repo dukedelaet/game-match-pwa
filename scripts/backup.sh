@@ -68,9 +68,11 @@ TMP_DIR="$(mktemp -d "$BACKUP_DIR/.tmp.XXXXXX")"
 # that nobody can list cannot be attributed to the run that left it, which is
 # the other half of using a unique name.
 chmod 755 "$TMP_DIR"
-# Discard this run's scratch on every exit path, including the guarded failures
-# below. This cannot catch SIGKILL -- nothing can -- so the sweep below is what
-# bounds that debris.
+# Discard this run's scratch on every normal exit path, including the guarded
+# failures below. This cannot catch an uncaught fatal signal (SIGKILL, and
+# SIGTERM/SIGINT arriving while a foreground child runs -- bash skips an EXIT
+# trap in that case, which is what `docker compose stop` mid-backup produces),
+# so the sweep below is what bounds that debris.
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 # Remove scratch left by runs that were killed outright, including the fixed
