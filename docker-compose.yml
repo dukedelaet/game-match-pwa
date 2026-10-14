@@ -92,6 +92,75 @@ services:
     # rather than finished. 30s matches the api service.
     stop_grace_period: 30s
 
+  # The scheduled backup: scripts/backup.sh, unchanged, on a 6-hourly loop.
+  #
+  # It replaces the gamematch-backup.timer systemd unit for the compose stack.
+  # Both run the same script; only the scheduler differs (hourly on the host,
+  # every 6 hours here). See docs/runbooks/restore.md for the restore side.
+  backup:
+    image: alpine:3.24
+    # DATA_DIR is not optional here. The script's built-in default is
+    # /var/lib/gamematch, which is the systemd unit's path and does not exist in
+    # this container; without it the first run exits 1 with "no database at
+    # /var/lib/gamematch/gamematch.db" and backs nothing up. Set here rather
+    # than as an argument because $1 is the OUTPUT directory, not the input.
+    environment:
+      DATA_DIR: /data
+    # Runs once immediately and then every 6 hours, so a fresh `up` takes a
+    # first backup without waiting out the interval. The script exits non-zero
+    # on any failure (no sqlite3, no database, a snapshot that fails its
+    # integrity or schema check); `sh -c` has no `set -e`, so a failed run logs
+    # and the loop continues to the next iteration rather than killing the
+    # container and restarting it.
+    #
+    # `apk add` rather than a baked image: the base is stock alpine, which has
+    # neither. `sqlite` is the package name — there is no `sqlite3` package on
+    # alpine (apk: "sqlite3 (no such package)") — and `bash` is needed because
+    # the script's shebang is #!/usr/bin/env bash. Both run once at start; the
+    # cost is that the container needs network access to the alpine repos, and
+    # will not start without it.
+    command:
+      - sh
+      - -c
+      - apk add --no-cache bash sqlite >/dev/null && while true; do /scripts/backup.sh /backups; sleep 21600; done
+    volumes:
+      - ./scripts:/scripts:ro
+      # NOT :ro. This is the one place the obvious choice is wrong, so it is
+      # worth the space.
+      #
+      # The database is WAL-mode, and SQLite will not open a WAL database on a
+      # read-only mount unless the -shm sidecar already exists and is readable
+      # (it holds the WAL index, and SQLite mmaps it; with no sidecar it tries
+      # to create one and gets "unable to open database file"). The sidecars
+      # only exist while a process holds the database open:
+      #
+      #   api running   -> -shm present -> :ro works
+      #   api stopped   -> SQLite checkpoints on clean close and deletes them
+      #                  -> :ro fails with rc=1
+      #
+      # Both states are real here. The first backup runs immediately at `up`,
+      # before the api has opened the database, and any backup scheduled while
+      # the api is restarting hits the second. Verified against alpine:3.24:
+      # the same script on the same file returned "unable to open database
+      # file" with :ro and "backup: wrote ..." with :rw.
+      #
+      # The risk of :rw is that this container could corrupt the live database.
+      # It is bounded: the image is stock alpine, the only commands are apk,
+      # sleep and the backup script, and the script only reads $DATA_DIR — its
+      # one write target is .backup's destination in /backups. Nothing here
+      # deletes or truncates $DATA_DIR. That bounds the risk from malice, not
+      # from a bug or a bad interaction, so this is a real reduction in defence
+      # in depth, accepted because the alternative is a backup that does not run.
+      - ./data:/data
+      - ./backups:/backups
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_started
+    # Do NOT add depends_on: service_healthy here to "fix" the mount. It would
+    # mask the real cause above and would still fail whenever the api is
+    # restarted on its own, which is when a backup is most wanted.
+
 # Named, not anonymous: only `docker compose down -v` removes these, and the
 # runbook must not use it — the app's ./data is a bind mount and survives that
 # anyway, but the certificates above would not.
