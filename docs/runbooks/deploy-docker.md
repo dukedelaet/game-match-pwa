@@ -193,41 +193,43 @@ but without it starts happily, serves a real Let's Encrypt certificate, and then
 being sent. With `APP_ENV=production` set, the server refuses to boot and *names*
 each variable it is missing, so you can fill them in at your own pace.
 
-Check the file before going further. Only the production block should be active:
+Check the file before going further. Three checks, each with one unambiguous
+expected result:
 
 ```bash
-grep -E '^[A-Z]' .env
+# 1. no key is set twice — no output means each appears exactly once
+grep -E '^[A-Z]' .env | cut -d= -f1 | sort | uniq -d
+
+# 2. no key is left empty — no output means every value is filled in
+grep -E '^[A-Z][A-Z_0-9]*=$' .env
+
+# 3. DEV_OTP is absent — no output means it is not set at all
+grep -E '^DEV_OTP=' .env
 ```
 
-Anything printed twice, or any line from the local block still uncommented, is a
-mistake. Then confirm the credentials are filled in and `DEV_OTP` is gone:
-
-```bash
-# names of the four required credentials — a fifth line here means the local
-# block's DEV_OTP=123456 survived, which is the crash loop below
-grep -E '^(TWILIO_ACCOUNT_SID|TWILIO_AUTH_TOKEN|TWILIO_FROM|TURNSTILE_SECRET|DEV_OTP)=' .env
-
-# anything still empty; no output means all four are set
-grep -E '^(TWILIO_ACCOUNT_SID|TWILIO_AUTH_TOKEN|TWILIO_FROM|TURNSTILE_SECRET)=' .env | grep -E '=$'
-```
+**Edit the values in place, in the file, with an editor.** Appending a corrected
+value does work — Compose's `env_file` takes the last occurrence, which is how the
+placeholder credentials below were set up — but it leaves the empty original on
+the line above. That produces a file where the two blocks disagree on the same
+key, which is the same class of mistake as the `DEV_OTP` one that crash-loops the
+API, and it makes check 1 above permanently red. Verified, for the record:
 
 ```
-TWILIO_ACCOUNT_SID=
-TWILIO_AUTH_TOKEN=
-TWILIO_FROM=
-TURNSTILE_SECRET=
+$ printf 'TWILIO_ACCOUNT_SID=ACplaceholder\n' >> .env
+$ grep -E '^[A-Z]' .env | cut -d= -f1 | sort | uniq -d
+TWILIO_ACCOUNT_SID
 ```
 
-Four lines, and no `DEV_OTP`. The second command prints nothing at that point
-because the values have not been filled in yet — it is what you run *after*
-editing, and it is the check that catches a forgotten one. `Config.Validate()`
-names a missing variable at boot, but only the first one per start, and the
-container crash-loops until you fix it.
+The container then gets the appended value — also verified, `docker compose exec
+api env | grep TWILIO_ACCOUNT_SID` printed `TWILIO_ACCOUNT_SID=ACplaceholder` — so
+the deploy works and the file is now ambiguous. Fill the value in on the existing
+line instead.
 
-If you prefer to append rather than edit in place, note that the last occurrence
-of a duplicated key wins, so appending is safe — verified, the container
-received `TWILIO_ACCOUNT_SID=ACplaceholder` from an appended line that followed
-an empty `TWILIO_ACCOUNT_SID=`.
+Check 1 compares **keys**, not whole lines, which is the whole point: the duplicate
+that matters is `TWILIO_ACCOUNT_SID=` followed by `TWILIO_ACCOUNT_SID=ACplaceholder`,
+two different lines. `sort | uniq -d` on whole lines does not see that, and a
+duplicated key with two identical values is found by accident rather than by
+design.
 
 ### 4. Create the data and backups directories
 
@@ -313,16 +315,23 @@ above. Nothing else is.)
 `depends_on: api: condition: service_healthy`), so by the time Caddy is listening
 the proxy upstream exists.
 
-First deploy only — create the demo users, so the site is not empty:
+**Local development hosts only — skip this on a VPS.** `seed` inserts demo
+accounts (Alex, Jordan, Staff) with fixed phone numbers and a known dev OTP. On a
+public host you do not want them:
 
 ```bash
+# your laptop
 docker compose run --rm api seed
-2026/10/14 22:28:40 seeded /data/gamematch.db
+2026/10/14 22:48:33 seeded /data/gamematch.db
 ```
 
-`seed` is idempotent: re-running it re-seeds over an existing database without
-complaint. On a public host you may prefer an empty database instead — the
-command is optional and skipping it just means no demo data.
+On a VPS, skip it: the command is optional and skipping it just means a fresh,
+empty database. Real users sign themselves up. (`seed` is idempotent — re-running
+it re-seeds over an existing database without complaint — so a demo row that does
+get created on a production host can be removed by deleting that user.)
+
+`deploy.md:88` says the same thing for the systemd path: *demo data is for local
+hosts only*.
 
 ### 7. First things to check
 
@@ -427,7 +436,7 @@ are in [Appendix A](#appendix-a--verification-evidence). The short form:
 | Security headers present | see Appendix A step 6 | `1` each |
 | API not exposed on the host | `curl -s -o /dev/null -w '%{http_code}\n' --max-time 3 http://127.0.0.1:8000/v1/healthz` | `000` |
 | Data directory ownership | `docker compose exec api ls -ldn /data` | `10001 10001` |
-| WAL is actually in use | `sqlite3 data/gamematch.db 'PRAGMA journal_mode;'` | `wal` |
+| WAL is actually in use | `docker compose exec backup sqlite3 /data/gamematch.db 'PRAGMA journal_mode;'` | `wal` |
 | Backups are landing | `ls -l backups/` | a new `.db` every 6h |
 
 ---
@@ -535,19 +544,26 @@ Full procedure, with the reasoning it rests on, in
 docker compose stop api          # nothing may write while you restore
 sudo mv data/gamematch.db data/gamematch.db.pre-restore
 sudo rm -f data/gamematch.db-wal data/gamematch.db-shm
+sudo mv data/photos data/photos.pre-restore      # only if there is an archive below
 sudo cp backups/gamematch-<stamp>.db data/gamematch.db
-sudo tar xzf backups/photos-<stamp>.tar.gz -C data
+sudo tar xzf backups/photos-<stamp>.tar.gz -C data   # guard it — see restore.md
 sudo chown -R 10001:10001 data
 docker compose start api
+sudo rm -rf data/gamematch.db.pre-restore data/photos.pre-restore   # after verifying
 ```
 
-Three things about that sequence that are specific to this stack:
+Five things about that sequence that are specific to this stack:
 
 1. **Stop the API first.** A live process rewrites the WAL sidecars mid-restore,
    and a `-wal` left beside a freshly restored database is replayed onto it.
-2. **`chown -R 10001:10001 data`, not just the `.db`.** The extracted photos
+2. **`sudo` on everything that touches `./data`.** That directory is mode `0755`
+   owned by UID 10001, so the deploy user cannot create or rename an entry in it.
+3. **`chown -R 10001:10001 data`, not just the `.db`.** The extracted photos
    directory comes back root-owned unless you do.
-3. **Verify as root, or after the API is back up.** `sqlite3 <file> 'SELECT ...'`
+4. **The photo archive is guarded.** `data/photos` does not exist on a fresh
+   stack, so the archive is legitimately absent and `tar` would exit 2 *after* the
+   database had already been replaced. `restore.md` wraps it in a test.
+5. **Verify as root, or after the API is back up.** `sqlite3 <file> 'SELECT ...'`
    opens read-write by default, and with the API stopped there is no `-shm` side
    car for it to use, so a plain host-side query fails:
    ```
@@ -555,7 +571,17 @@ Three things about that sequence that are specific to this stack:
    Parse error in 2nd command line argument: attempt to write a readonly database (8)
    ```
    Once `docker compose start api` has run, the sidecars exist and the same
-   query works.
+   query works. Or ask the `backup` container, which has `sqlite3` and the same
+   bind mount and answers either way:
+   ```
+   $ docker compose exec backup sqlite3 /data/gamematch.db 'PRAGMA journal_mode;'
+   wal
+   ```
+
+The last two lines — deleting the `.pre-restore` copies — are not optional
+tidiness. `gamematch.db.pre-restore` is a **complete stale copy of the database**,
+inside the directory the backup service archives from, and nothing prunes it.
+Keep the aside files only for as long as you might still need to roll back.
 
 ---
 
@@ -575,7 +601,7 @@ in the appendix.
 | **`curl https://your.domain/…` fails with `curl: (35) TLS connect error`.** Plain HTTP still answers `308 Permanent Redirect` to an HTTPS that cannot complete, so "the redirect works" is not a good sign. | Caddy could not obtain a certificate — usually because DNS was pointed at the host *after* the first start, or 80/443 is firewalled, or `GAMEMATCH_SITE` is still the `gamematch.example.com` placeholder. | `docker compose logs web \| grep tls.obtain` | Point the A/AAAA record at this host and **confirm it resolves from here** (`getent hosts your.domain`) before restarting. Caddy retries on its own — `will retry … retrying_in: 60 … max_duration: 2592000`, i.e. 30 days — so `docker compose restart web` will pick it up immediately but is not required once DNS resolves. On a real domain the CA's error differs: a name that does not resolve fails at the HTTP-01 challenge step, not at order creation. |
 | **`docker compose build web` fails with `"/apps/web/dist": not found`.** | `apps/web/dist` is gitignored and the web image copies it without building it. | The error names the `COPY` line. | `pnpm install && pnpm --filter web build`, then rebuild. |
 | **Every call through Caddy 502s, but the API container is healthy.** | `ADDR` was set to `127.0.0.1:8000` — from a stray `ADDR=` line in `.env`. Container loopback is not reachable from a sibling container. | `docker compose logs api \| head -1` — it will say `listening on http://127.0.0.1:8000`, not `0.0.0.0:8000` | Remove the `ADDR` line. The image sets `ENV ADDR=0.0.0.0:8000`; do not add one to `.env`. |
-| **The database will not open, or `backup` fails with `disk I/O error` / `unable to open database file`.** | SQLite runs in WAL mode, which needs a filesystem with working POSIX locking. Some VPS overlay and network filesystems do not have it. The service can start and then fail on first write. | `sqlite3 data/gamematch.db 'PRAGMA journal_mode;'` — `wal` means locking works. | Put `./data` on local disk (ext4, xfs, btrfs), not on NFS, CIFS, or a fuse mount. Relocating it is a stop, `mv`, restart. |
+| **The database will not open, or `backup` fails with `disk I/O error` / `unable to open database file`.** | SQLite runs in WAL mode, which needs a filesystem with working POSIX locking. Some VPS overlay and network filesystems do not have it. The service can start and then fail on first write. | `docker compose exec backup sqlite3 /data/gamematch.db 'PRAGMA journal_mode;'` — `wal` means locking works. Run it **in the `backup` container, not on the host**: `sqlite3` opens read-write by default and, with the API stopped, there is no `-shm` sidecar for it to use, so the host-side form fails with `attempt to write a readonly database (8)` — the same trap as [Restoring](#restoring). The `backup` container has `sqlite3` and the same bind mount, and answers either way. | Put `./data` on local disk (ext4, xfs, btrfs), not on NFS, CIFS, or a fuse mount. Relocating it is a stop, `mv`, restart. |
 | **Nobody can sign in, and the response is `{"ok":true}` with no `devCode`.** | `otp/start` enforces its rate limits **silently**: over the limit it stores nothing and says nothing else, on purpose, so the endpoint cannot be used to probe which numbers exist. Limits are 5 per IP and 3 per phone per 15 minutes and they are **persisted**, so restarting `api` does not clear them. | `sqlite3 data/gamematch.db "SELECT bucket, count FROM rate_limits WHERE bucket LIKE 'otp:start%';"` — with `APP_DEBUG=true`, a code that *was* issued comes back as `devCode`, so its absence is the signal. | Wait the window out, or clear the rows. Do not conclude the configuration is wrong. |
 | **`sms send: twilio: status 401: Authentication Error - invalid username`.** | Wrong `TWILIO_ACCOUNT_SID`/`TWILIO_AUTH_TOKEN`. The request still returns `{"ok":true}`. | `docker compose logs api \| grep "sms send"` | Fix the credentials and `docker compose up -d --force-recreate api`. |
 | **No `photos-*.tar.gz` across several consecutive backups.** | `data/photos` is gone. The script skips the archive without warning, exits 0, and the backup container stays `healthy` because its healthcheck only looks at `.db` files. | `ls -ld data/photos`; compare consecutive `ls backups/` listings | Restore the directory. Until then every backup is database-only — see [Backups](#backups). |
@@ -1863,12 +1889,11 @@ recovers with no other change — the ACME account and certificate live in the
 
 Run end to end against a live stack. This is the step that decides whether the
 backup is worth having, so the failures are recorded as well as the result.
-
 #### Setup — rows worth losing
 
 ```
 $ docker compose run --rm api seed
-2026/10/14 22:28:40 seeded /data/gamematch.db
+2026/10/14 22:48:33 seeded /data/gamematch.db
 
 $ curl -sk -X POST https://localhost/v1/auth/otp/start -d '{"phone":"+15551239999"}'
 {"devCode":"123456","ok":true}
@@ -1880,20 +1905,50 @@ $ curl -sk -X POST https://localhost/v1/auth/otp/verify \
 
 $ curl -sk -b jar -X POST https://localhost/v1/me/photos \
     -F "photo=@apps/web/dist/icons/icon-192.png;type=image/png"
-{"photo":{"id":"ade26679-efd6-4785-8b49-72af32a4f7ad","url":"/v1/photos/ade26679-efd6-4785-8b49-72af32a4f7ad","state":"ok"}}
+{"photo":{"id":"6e961a3e-4665-450e-864d-18c97755b2fe","url":"/v1/photos/6e961a3e-4665-450e-864d-18c97755b2fe","state":"ok"}}
 
 $ ls -ldn data data/photos
-drwxr-xr-x 1 10001 10001 100 Oct 14 15:28 data
-drwxr-x--- 1 10001 10001  72 Oct 14 15:28 data/photos
+drwxr-xr-x 1 10001 10001 100 Oct 14 15:48 data
+drwxr-x--- 1 10001 10001  72 Oct 14 15:48 data/photos
 
 $ sqlite3 data/gamematch.db 'SELECT count(*) FROM users;'
 5
 ```
 
-`devCode` is present because `APP_ENV=local` / `APP_DEBUG=true`. A production
-host returns `{"ok":true}` with no `devCode`, and the OTP cannot be read off the
-database — so a restore drill has to run against a local-mode stack. Nothing
-else about the stack differs.
+`devCode` is present here because `APP_ENV=local` / `APP_DEBUG=true`. **That is a
+convenience, not a requirement.** `otp_codes.code` is stored in plaintext —
+`PutOTP` writes the code verbatim into the column
+(`apps/server/internal/store/auth.go:59-63`) — so a drill can read a real code off
+a production-mode database and the only difference is that it is a random code
+rather than the constant `123456`:
+
+```
+$ docker compose exec api env | grep -E '^(APP_ENV|APP_DEBUG)=' | sort
+APP_DEBUG=false
+APP_ENV=production
+
+$ curl -sk -X POST https://localhost/v1/auth/otp/start -d '{"phone":"+15559990000"}'
+{"ok":true}
+
+$ sqlite3 data/gamematch.db "SELECT phone, code, code = '123456' AS is_dev_otp FROM otp_codes WHERE phone = '+15559990000';"
++15559990000|423454|0
+```
+
+`is_dev_otp = 0` — a random code, read straight out of a **production** database,
+and **no `devCode` in the response** because `APP_DEBUG=false`. This drill was
+recorded in local mode only because that is what this host's `.env` held; nothing
+about it requires `APP_ENV=local`.
+
+**Do not run a production host in `APP_ENV=local` / `APP_DEBUG=true` to make a
+drill easier.** That makes every one-time code the constant `123456` and returns
+it in the response body, so anyone who can reach the site can sign in as any
+phone number — the exact hole `Validate()` exists to close, and the subject of the
+first `DEV_OTP` row in [Troubleshooting](#troubleshooting).
+
+(The Twilio send in production mode genuinely fails with
+`sms send: twilio: status 401: Authentication Error - invalid username` against
+placeholder credentials. The request still answers `200`, which is the silent
+credential-miss signature from [Troubleshooting](#troubleshooting).)
 
 #### The scheduled backup lands
 
@@ -1902,29 +1957,29 @@ The `backup` service runs once about 35 seconds after start (`apk add`, then
 
 ```
 $ docker compose ps backup
-NAME                 IMAGE         COMMAND                  SERVICE   CREATED         STATUS                             PORTS
-gamematch-backup-1   alpine:3.24   "sh -c 'apk add --no…"   backup    About a minute   Up About a minute (healthy)   
+NAME                 IMAGE         COMMAND                  SERVICE   CREATED              STATUS                        PORTS
+gamematch-backup-1   alpine:3.24   "sh -c 'apk add --no…"   backup    About a minute ago   Up About a minute (healthy)   
 
 $ docker compose logs --tail 5 backup
-backup-1  | backup: wrote /backups/gamematch-20261014T222905Z.db
+backup-1  | backup: wrote /backups/gamematch-20261014T224853Z.db
 
 $ ls -la backups/
 total 516
-drwxr-xr-x 1 duke duke      118 Oct 14 15:29 .
-drwxr-xr-x 1 duke duke      438 Oct 14 15:27 ..
--rw-r--r-- 1 root root 516096 Oct 14 22:29 gamematch-20261014T222905Z.db
--rw-r--r-- 1 root root   8984 Oct 14 22:29 photos-20261014T222905Z.tar.gz
+drwxr-xr-x 1 duke duke      118 Oct 14 15:48 .
+drwxr-xr-x 1 duke duke      438 Oct 14 15:47 ..
+-rw-r--r-- 1 root root 516096 Oct 14 22:48 gamematch-20261014T224853Z.db
+-rw-r--r-- 1 root root   8991 Oct 14 22:48 photos-20261014T224853Z.tar.gz
 ```
 
 Both artefacts, from the loop, unprompted. `photos-*.tar.gz` is present only
-because the upload above created `data/photos` — see Appendix A.1 step 8 for what
+because the upload above created `data/photos` — see [Backups](#backups) for what
 its absence means.
 
-The on-demand path from [Backups](#backups), also verified:
+The on-demand path, also verified:
 
 ```
 $ docker compose exec backup /scripts/backup.sh /backups
-backup: wrote /backups/gamematch-20261014T222944Z.db
+backup: wrote /backups/gamematch-20261014T225343Z.db
 rc=0
 ```
 
@@ -1933,36 +1988,43 @@ And the form that does not work, for the record:
 ```
 $ docker compose run --rm --entrypoint /scripts/backup.sh backup /backups
  Container gamematch-api-1 Running
- Container gamematch-backup-run-2370f68e0a50 Creating
- Container gamematch-backup-run-2370f68e0a50 Created
+ Container gamematch-backup-run-0e0300581ef2 Creating
+ Container gamematch-backup-run-0e0300581ef2 Created
 env: can't execute 'bash': No such file or directory
 
 rc=127
 ```
 
 Overriding the entry point replaces the service's `command:`, which is where
-`apk add --no-cache bash sqlite` lives. Stock alpine has no bash and the script's
-shebang is `#!/usr/bin/env bash`.
+`apk add --no-cache bash sqlite` lives. Stock alpine has **no bash** *and* **no
+`sqlite3`** — `command -v sqlite3` in a bare `alpine:3.24` prints nothing — which
+is why the restore block below has to install one for itself.
 
-#### Write one more row, so the restore has something to lose
+#### Write more rows after the snapshot, so the restore has something to lose
+
+One more user and one more photo, both **after** `224853Z` was taken:
 
 ```
 $ curl -sk -X POST https://localhost/v1/auth/otp/start -d '{"phone":"+15552228888"}'
 {"devCode":"123456","ok":true}
 $ curl -sk -X POST https://localhost/v1/auth/otp/verify \
-    -d "{\"phone\":\"+15552228888\",\"code\":\"$CODE\"}" -o /dev/null -w '%{http_code}\n'
+    -d "{\"phone\":\"+15552228888\",\"code\":\"$CODE\"}" -o /dev/null -w 'verify=%{http_code}\n'
 verify=200
-$ sqlite3 data/gamematch.db "SELECT u.id, p.phone_e164, u.created_at FROM users u JOIN user_private p ON p.user_id=u.id WHERE p.phone_e164='+15552228888';"
-f9521e58-501b-4444-b95d-64d9001dd466|+15552228888|2026-10-14T22:29:38.319487Z
+$ curl -sk -b jar -X POST https://localhost/v1/me/photos \
+    -F "photo=@apps/web/dist/icons/icon-192.png;type=image/png"
+{"photo":{"id":"c9a7334b-d305-43d0-a3e1-f2aa4a15e9a8","url":"/v1/photos/c9a7334b-d305-43d0-a3e1-f2aa4a15e9a8","state":"ok"}}
 
-$ for f in backups/gamematch-*.db; do printf '%s %s\n' "$f" "$(sqlite3 "$f" 'SELECT count(*) FROM users;')"; done
-backups/gamematch-20261014T222905Z.db 5
-backups/gamematch-20261014T222944Z.db 6
+$ sqlite3 data/gamematch.db 'SELECT count(*) FROM users;'
+6
+$ sqlite3 data/gamematch.db 'SELECT id, path FROM photos;'
+6e961a3e-4665-450e-864d-18c97755b2fe|37aa1c41-127c-4e00-9493-a31f5e18b33b/6e961a3e-4665-450e-864d-18c97755b2fe.jpg
+c9a7334b-d305-43d0-a3e1-f2aa4a15e9a8|8c7bc12b-df78-4692-a067-bc4a91a3f1e6/c9a7334b-d305-43d0-a3e1-f2aa4a15e9a8.jpg
 ```
 
-Two snapshots, 5 and 6 users. **The drill restores the 5-user one.** Restoring
-the newest would return a count equal to the live one and prove nothing — the
-whole test is that data written *after* the snapshot is gone.
+Six live users against five in the snapshot; two live photos against one. **The
+drill restores `224853Z`.** Restoring the newest snapshot instead would return a
+count equal to the live one and prove nothing — the whole test is that data
+written *after* the snapshot is gone.
 
 #### The plan's commands fail for a non-root deploy user
 
@@ -1976,14 +2038,12 @@ $ docker compose stop api
  Container gamematch-api-1 Stopping
  Container gamematch-api-1 Stopped
 
-$ sqlite3 "$STAMP" 'SELECT count(*) FROM users;' > /tmp/before.txt
-$ sqlite3 data/gamematch.db 'SELECT count(*) FROM users;' > /tmp/live.txt
+$ sqlite3 data/gamematch.db 'SELECT count(*) FROM users;'
 Parse error in 2nd command line argument: attempt to write a readonly database (8)
 
 $ mv data/gamematch.db data/gamematch.db.pre-restore
 mv: cannot move 'data/gamematch.db' to 'data/gamematch.db.pre-restore': Permission denied
 
-$ rm -f data/gamematch.db-wal data/gamematch.db-shm
 $ cp "$STAMP" data/gamematch.db
 cp: cannot create regular file 'data/gamematch.db': Permission denied
 ```
@@ -1992,74 +2052,118 @@ The `sqlite3` failure is the more interesting one and it is **not** about
 permissions on the file. `sqlite3` opens read-write by default, and a WAL
 database needs its `-shm` sidecar; with the API stopped there is no `-shm`, so
 SQLite tries to create one in a directory the host user does not own. The
-sidecars are gone precisely *because* the API was stopped cleanly:
+sidecars are gone precisely *because* the API was stopped cleanly — `./data` holds
+the database and the photo directory and nothing else:
 
 ```
-$ ls data
-gamematch.db
-gamematch.db.pre-restore
-photos
-photos.pre-restore
+$ ls -ln data
+-rw-r--r-- 1 10001 10001 516096 Oct 14 15:49 gamematch.db
+drwxr-x--- 1 10001 10001   144 Oct 14 15:49 photos
 
 $ docker compose start api >/dev/null; sleep 4
 $ ls -ln data
--rw-r--r-- 1 10001 10001 516096 Oct 14 15:30 gamematch.db
--rw-r--r-- 1 10001 10001 32768 Oct 14 15:31 gamematch.db-shm
--rw-r--r-- 1 10001 10001     0 Oct 14 15:31 gamematch.db-wal
+-rw-r--r-- 1 10001 10001 516096 Oct 14 15:49 gamematch.db
+-rw-r--r-- 1 10001 10001 32768 Oct 14 15:52 gamematch.db-shm
+-rw-r--r-- 1 10001 10001     0 Oct 14 15:52 gamematch.db-wal
+drwxr-x--- 1 10001 10001   144 Oct 14 15:49 photos
 
 $ sqlite3 data/gamematch.db 'SELECT count(*) FROM users;'
-5
+6
 rc=0
 ```
 
 The API recreates both sidecars on open and the same host-side query works. So:
-**verify either as root, or after the API is back up.** The same mechanism is why
-the `backup` service's `./data` mount cannot be `:ro` (`docker-compose.yml`).
+**verify either as root, or after the API is back up** — or from inside the
+`backup` container, which has `sqlite3` and the same bind mount and answers either
+way:
+
+```
+$ docker compose stop api >/dev/null
+$ docker compose exec backup sqlite3 /data/gamematch.db 'PRAGMA journal_mode;'
+wal
+rc=0
+$ sqlite3 data/gamematch.db 'PRAGMA journal_mode;'
+rc=1
+Parse error in 2nd command line argument: attempt to write a readonly database (8)
+$ docker compose start api >/dev/null
+```
+
+The same mechanism is why the `backup` service's `./data` mount cannot be `:ro`
+(`docker-compose.yml`).
 
 #### The restore, as root
 
-Same three operations, done with the privileges they need. On a VPS, `sudo`
-instead of the container:
+Same operations, done with the privileges they need. On a VPS, `sudo` instead of
+the container — `restore.md` publishes the `sudo` form.
+
+**`apk add --no-cache sqlite` and `set -e` are load-bearing here.** Stock alpine
+has no `sqlite3`, so without the first line the `sqlite3` call below fails with
+`sqlite3: not found` and rc 127 — and `sh -c` has no `set -e`, so the script
+carries straight on and publishes a restore transcript anyway. Without the second,
+nothing at all stops a failing step from being recorded as a succeeding one. This
+is the exact shape of bug the drill exists to catch, and it is why the block below
+shows its `apk` output in full:
 
 ```
 $ docker run --rm -v "$PWD/data:/d" -v "$PWD/backups:/b:ro" alpine:3.24 sh -c "
+    set -e
+    apk add --no-cache sqlite
     echo -n 'live users before restore: '; sqlite3 /d/gamematch.db 'SELECT count(*) FROM users;'
     mv /d/gamematch.db /d/gamematch.db.pre-restore
     rm -f /d/gamematch.db-wal /d/gamematch.db-shm
-    cp /b/gamematch-20261014T222905Z.db /d/gamematch.db
-    tar xzf /b/photos-20261014T222905Z.tar.gz -C /d
+    mv /d/photos /d/photos.pre-restore
+    cp /b/gamematch-20261014T224853Z.db /d/gamematch.db
+    tar xzf /b/photos-20261014T224853Z.tar.gz -C /d
     chown -R 10001:10001 /d
     ls -ln /d
   "
+(1/4) Installing ncurses-terminfo-base (6.6_p20260516-r0)
+(2/4) Installing libncursesw (6.6_p20260516-r0)
+(3/4) Installing readline (8.3.3-r1)
+(4/4) Installing sqlite (3.53.4-r0)
+Executing busybox-1.37.0-r31.trigger
+OK: 10.7 MiB in 20 packages
 live users before restore: 6
--rw-r--r-- 1 10001 10001 516096 Oct 14 22:30 gamematch.db
--rw-r--r-- 1 10001 10001 516096 Oct 14 22:29 gamematch.db.pre-restore
-drwxr-x--- 1 10001 10001     72 Oct 14 22:30 photos
+total 1008
+-rw-r--r-- 1 10001    10001       516096 Oct 14 22:49 gamematch.db
+-rw-r--r-- 1 10001    10001       516096 Oct 14 22:49 gamematch.db.pre-restore
+drwxr-x--- 1 10001    10001           72 Oct 14 22:49 photos
+drwxr-x--- 1 10001    10001          144 Oct 14 22:49 photos.pre-restore
 ```
 
 **6 live, 5 in the snapshot.** That difference is the loss the drill is built
-around. The photo archive:
+around.
+
+`mv /d/photos /d/photos.pre-restore` is there for the same reason the database is
+moved aside: extracting the archive over a live `data/photos` leaves every
+photo directory uploaded **after** the snapshot sitting there, orphaned from a
+database that no longer references them. Move it, restore over it, then delete
+both at the end (below).
+
+The photo archive itself:
 
 ```
-$ tar tzf backups/photos-20261014T222905Z.tar.gz
+$ tar tzf backups/photos-20261014T224853Z.tar.gz
 photos/
-photos/2e0df506-ff09-400d-a7ad-0d356d86f1a0/
-photos/2e0df506-ff09-400d-a7ad-0d356d86f1a0/ade26679-efd6-4785-8b49-72af32a4f7ad.jpg
-photos/2e0df506-ff09-400d-a7ad-0d356d86f1a0/ade26679-efd6-4785-8b49-72af32a4f7ad_t.jpg
+photos/37aa1c41-127c-4e00-9493-a31f5e18b33b/
+photos/37aa1c41-127c-4e00-9493-a31f5e18b33b/6e961a3e-4665-450e-864d-18c97755b2fe.jpg
+photos/37aa1c41-127c-4e00-9493-a31f5e18b33b/6e961a3e-4665-450e-864d-18c97755b2fe_t.jpg
 ```
 
 restored with UID 10001 and mode 0640:
 
 ```
-$ docker run --rm -v "$PWD/data:/d:ro" alpine:3.24 ls -l /d/photos/2e0df506-ff09-400d-a7ad-0d356d86f1a0
-total 12
--rw-r----- 1 10001 10001 4056 Oct 14 22:28 ade26679-efd6-4785-8b49-72af32a4f7ad.jpg
--rw-r----- 1 10001 10001 6008 Oct 14 22:28 ade26679-efd6-4785-8b49-72af32a4f7ad_t.jpg
+$ docker run --rm -v "$PWD/data:/d:ro" alpine:3.24 find /d/photos | sort
+/d/photos
+/d/photos/37aa1c41-127c-4e00-9493-a31f5e18b33b
+/d/photos/37aa1c41-127c-4e00-9493-a31f5e18b33b/6e961a3e-4665-450e-864d-18c97755b2fe.jpg
+/d/photos/37aa1c41-127c-4e00-9493-a31f5e18b33b/6e961a3e-4665-450e-864d-18c97755b2fe_t.jpg
 ```
 
-That listing is itself worth knowing about: `data/photos` is mode `0750`, so the
-host user cannot `find` into it without `sudo`, and a restore check that tries
-will look like a failure. `media.dirPerm`
+Exactly the snapshot's photo, and **not** the one uploaded after it. That listing
+also shows why it has to be read from a container: `data/photos` is mode `0750`,
+so the host user gets `ls: cannot open directory 'data/photos': Permission denied`
+and a restore check that tries looks like a failure. `media.dirPerm`
 (`apps/server/internal/media/photos.go:93`) is deliberate.
 
 #### The verification
@@ -2070,8 +2174,8 @@ $ docker compose start api
  Container gamematch-api-1 Started
 
 $ docker compose ps api
-NAME              IMAGE                  COMMAND                  SERVICE   CREATED         STATUS                   PORTS
-gamematch-api-1   gamematch-api:latest   "/usr/local/bin/game…"   api       2 minutes ago   Up 4 seconds (healthy)   8000/tcp
+NAME              IMAGE                  COMMAND                  SERVICE   CREATED           STATUS                   PORTS
+gamematch-api-1   gamematch-api:latest   "/usr/local/bin/game…"   api       About a minute    Up 4 seconds (healthy)   8000/tcp
 
 $ curl -sk -o /dev/null -w '%{http_code}\n' https://localhost/v1/healthz
 200
@@ -2083,51 +2187,66 @@ $ diff /tmp/opencode/before.txt /tmp/opencode/after.txt && echo "restore verifie
 restore verified
 ```
 
-**`restore verified`.** `before` and `after` are both `5`, matching the 5 users
-in the snapshot, against 6 in the live database before the restore.
+**`restore verified`.** `before` and `after` are both `5`, matching the 5 users in
+the snapshot, against 6 in the live database before the restore.
 
-The counts alone prove the file was copied. These prove it was the *right*
-file, and that the restore actually rolled something back:
+The counts alone prove the file was copied. These prove it was the *right* file,
+and that the restore actually rolled something back:
 
 ```
 $ sqlite3 data/gamematch.db 'PRAGMA integrity_check;'
 ok
 $ sqlite3 data/gamematch.db 'SELECT count(*) FROM sqlite_master;'
 106
-$ sqlite3 data/gamematch.db "SELECT count(*) FROM users u JOIN user_private p ON p.user_id=u.id WHERE p.phone_e164 IN ('+15552228888','+15553334444');"
+$ sqlite3 data/gamematch.db "SELECT count(*) FROM users u JOIN user_private p ON p.user_id=u.id WHERE p.phone_e164 = '+15552228888';"
 0
 $ sqlite3 data/gamematch.db 'SELECT id, path FROM photos;'
-ade26679-efd6-4785-8b49-72af32a4f7ad|2e0df506-ff09-400d-a7ad-0d356d86f1a0/ade26679-efd6-4785-8b49-72af32a4f7ad.jpg
+6e961a3e-4665-450e-864d-18c97755b2fe|37aa1c41-127c-4e00-9493-a31f5e18b33b/6e961a3e-4665-450e-864d-18c97755b2fe.jpg
 $ sqlite3 data/gamematch.db 'PRAGMA journal_mode;'
 wal
 $ sqlite3 data/gamematch.db 'PRAGMA user_version;'
 9
 $ docker inspect --format 'RestartCount={{.RestartCount}} Status={{.State.Status}}' gamematch-api-1
 RestartCount=0 Status=running
-$ docker compose logs api | tail -4
-api-1  | 2026/10/14 22:31:05 GET /v1/healthz 200 0s
-api-1  | 2026/10/14 22:31:18 shutdown: draining
-api-1  | 2026/10/14 22:31:23 gamematch listening on http://0.0.0.0:8000 (data dir /data, debug=true)
-api-1  | 2026/10/14 22:31:25 GET /v1/healthz 200 0s
 ```
 
-Both users created after the snapshot — `+15552228888` (`f9521e58-…`) and a
-second one, `+15553334444` (`6c7aaae9-…`) — are **absent** from the restored
-database. The photo row and both its files came back. The restored database is
-in WAL mode and at `user_version 9`, the same schema level the live one was.
+The user created **after** the snapshot is **absent**. The photo uploaded after
+it is absent from both the database and the directory. The restored database is
+WAL-mode at `user_version 9` — the same schema level the live one was.
 
-The `rate_limits` table rolled back too, which is a nice cross-check that the
-restore is real and not a coincidence of counts:
+The `rate_limits` table rolled back too, which is the cleanest cross-check,
+because it is a number whose pre-restore value is known:
 
 ```
 $ sqlite3 data/gamematch.db "SELECT bucket, count FROM rate_limits WHERE bucket LIKE 'otp:start%';"
-otp:start:ip:4be83b3115428950|1
+otp:start:ip:245c0ffc0f6a0215|1
 otp:start:phone:834fa3a38e93d341|1
 ```
 
-A count of `1` for the per-IP bucket, when five sign-ins had been made during
+A count of `1` for the per-IP bucket, when three sign-ins had been made during
 the drill. The snapshot was taken after the first one. **A restore that had
-silently not happened would show `4`.**
+silently not happened would show `3`.**
+
+#### Clear the aside files
+
+```
+$ docker run --rm -v "$PWD/data:/d" alpine:3.24 sh -c "
+    rm -rf /d/gamematch.db.pre-restore /d/photos.pre-restore
+    ls -ln /d
+  "
+total 536
+-rw-r--r-- 1 10001 10001 516096 Oct 14 22:49 gamematch.db
+-rw-r--r-- 1 10001 10001 32768 Oct 14 22:49 gamematch.db-shm
+-rw-r--r-- 1 10001 10001     0 Oct 14 22:49 gamematch.db-wal
+drwxr-x--- 1 10001 10001    72 Oct 14 22:49 photos
+```
+
+`./data` is back to exactly what a steady-state stack holds. Until this step
+`./data` also held a **complete stale copy of the pre-restore database** and a
+stale photo tree, neither of which anything prunes — `gamematch.db.pre-restore`
+is a full SQLite database the size of the live one, and it sits inside the
+directory the backup service archives from. Delete both once the restore is
+verified; keep them only for as long as you might still need to roll back.
 
 #### One artefact worth knowing about
 
@@ -2136,28 +2255,71 @@ it — even with `mode=ro`, because a WAL database's index lives in the shared
 memory file:
 
 ```
+$ sqlite3 "backups/gamematch-20261014T224853Z.db" 'SELECT count(*) FROM users;'
+5
 $ ls -ln backups/
--rw-r--r-- 1    0    0 516096 Oct 14 22:29 gamematch-20261014T222905Z.db
--rw-r--r-- 1 1000 1000 32768 Oct 14 22:30 gamematch-20261014T222905Z.db-shm
--rw-r--r-- 1    0    0     0 Oct 14 22:29 gamematch-20261014T222905Z.db-wal
+-rw-r--r-- 1    0    0 516096 Oct 14 22:48 gamematch-20261014T224853Z.db
+-rw-r--r-- 1 1000 1000 32768 Oct 14 22:50 gamematch-20261014T224853Z.db-shm
+-rw-r--r-- 1    0    0     0 Oct 14 22:49 gamematch-20261014T224853Z.db-wal
 ```
 
-Harmless — both are 0 bytes or an empty index, so nothing is pending in them —
-but the prune in `scripts/backup.sh` matches `gamematch-*.db` and
-`photos-*.tar.gz`, so **these sidecars are never deleted** and accumulate in
-`./backups` at 32 KiB per snapshot for the life of the deployment:
+That is 32 KiB per snapshot — roughly 46 MB a year at four runs a day — and
+neither name matched `scripts/backup.sh`'s prune, so they used to accumulate for
+the life of a deployment. `backup.sh` now sweeps them, and **the rule is
+"orphaned", not "old"**: a sidecar is removed only when the `.db` it belongs to
+is gone. A sidecar whose snapshot still exists survives no matter how old, because
+that snapshot may be being read right now.
+
+Verified against the live stack — a real orphan (no `.db`) planted alongside a live
+snapshot's sidecars, then one ordinary scheduled run:
 
 ```
-$ find backups/ -name 'gamematch-*.db' | sort
-backups/gamematch-20261014T222905Z.db
-backups/gamematch-20261014T222944Z.db
-$ find backups/ -name 'photos-*.tar.gz' | sort
-backups/photos-20261014T222905Z.tar.gz
-backups/photos-20261014T222944Z.tar.gz
+$ touch backups/gamematch-20990101T000000Z.db-shm backups/gamematch-20990101T000000Z.db-wal
+$ docker compose exec backup /scripts/backup.sh /backups
+backup: wrote /backups/gamematch-20261014T225132Z.db
+$ ls -ln backups/
+-rw-r--r-- 1    0    0 516096 Oct 14 22:48 gamematch-20261014T224853Z.db
+-rw-r--r-- 1 1000 1000 32768 Oct 14 22:50 gamematch-20261014T224853Z.db-shm
+-rw-r--r-- 1    0    0     0 Oct 14 22:49 gamematch-20261014T224853Z.db-wal
+-rw-r--r-- 1    0    0 516096 Oct 14 22:51 gamematch-20261014T225132Z.db
+-rw-r--r-- 1    0    0   8991 Oct 14 22:48 photos-20261014T224853Z.tar.gz
+-rw-r--r-- 1    0    0   8993 Oct 14 22:51 photos-20261014T225132Z.tar.gz
 ```
 
-Two snapshots, four prune matches — the four `-shm`/`-wal` files in the listing
-above match neither pattern.
+The `20990101T000000Z` sidecars are gone; `224853Z`'s two sidecars survived,
+because `224853Z.db` is right there beside them.
 
-They also cannot corrupt a restore: the procedure copies the `.db` and not the
-sidecars, which is the correct behaviour. Do not start copying `*.db*`.
+The full matrix, in a throwaway directory and run twice — once under busybox
+`ash` in `alpine:3.24`, once under GNU bash/coreutils on the host, with identical
+results both times:
+
+| Fixture | Expected | Result |
+| --- | --- | --- |
+| `gamematch-LIVE.db` + `-shm` + `-wal` | all three survive | survived |
+| `gamematch-GONE.db-shm` + `-wal`, no `.db` | sidecars removed | removed |
+| `gamematch-OLD.db` + sidecars, all dated 30 days ago | `.db` pruned by age, sidecars swept with it in the same run | all three removed |
+| `.tmp.INFLIGHT/gamematch-….db{,-shm,-wal}` | untouched — a concurrent run's scratch | untouched |
+
+```
+$ docker run --rm -v …/scripts:/scripts:ro -v …/b:/b alpine:3.24 sh /run.sh
+backup: wrote /b/gamematch-20261014T225121Z.db
+rc=0
+$ find . | sort
+./gamematch-20261014T225121Z.db
+./gamematch-LIVE.db
+./gamematch-LIVE.db-shm
+./gamematch-LIVE.db-wal
+./.tmp.INFLIGHT/gamematch-20261014T999999Z.db
+./.tmp.INFLIGHT/gamematch-20261014T999999Z.db-shm
+./.tmp.INFLIGHT/gamematch-20261014T999999Z.db-wal
+
+$ DATA_DIR=…/src bash scripts/backup.sh …/b2
+backup: wrote …/b2/gamematch-20261014T225125Z.db
+rc=0
+```
+
+(both listings identical — the LIVE pair kept, the orphans and the 30-day-old set
+gone, the in-flight scratch untouched)
+
+The sidecars still cannot corrupt a restore: the procedure copies the `.db` and
+not the sidecars, which is correct. Do not start copying `*.db*`.

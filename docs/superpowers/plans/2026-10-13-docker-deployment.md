@@ -677,7 +677,7 @@ Two steps belong between `chown` and `up --build -d`, both found in Task 5 and T
 Include a troubleshooting table keyed to the failures this stack actually produces: API unreachable through Caddy (`ADDR` left at loopback), permission denied on `./data` (UID), Caddy certificate failure (DNS not yet pointed), and a database that will not open (filesystem without WAL support).
 
 Beyond the four the plan names, the rows this stack actually produced during
-Tasks 4–6: `server misbehaving` from Docker's embedded DNS while `api`
+Tasks 4–7: `server misbehaving` from Docker's embedded DNS while `api`
 crash-loops (which is *not* `connection refused`, and editing `GAMEMATCH_API`
 fixes nothing); `docker compose ps` reporting a crash loop as
 `Up 1 second (health: starting)`; `.State.ExitCode` reading `0` during a crash
@@ -686,6 +686,19 @@ loop; `otp/start` returning `{"ok":true}` and storing nothing once a
 silently database-only while the container stays `healthy`; `caddy reload`
 failing because the Caddyfile sets `admin off`; and `env: can't execute 'bash'`
 from a manual backup run with `--entrypoint sh`.
+
+The `.env` section must tell **one** story about how values are set. Appending a
+corrected value works (Compose's `env_file` takes the last occurrence) but
+leaves the empty original above it, which is the same ambiguity as the `DEV_OTP`
+bug and makes any "is this key still empty?" check permanently red. Publish
+in-place editing, and make the check compare *keys* — `grep -E '^[A-Z]' .env |
+cut -d= -f1 | sort | uniq -d` — not whole lines, which does not detect two
+different values for one key.
+
+Do **not** tell a reader to run a production host in `APP_ENV=local` to make a
+drill easier. `otp_codes.code` is plaintext (`internal/store/auth.go:59-63`), so
+the drill works in production mode with no such step; the instruction would only
+make every code the constant `123456` and return it in the response.
 
 - [ ] **Step 2: Repoint `deploy.md`**
 
@@ -724,34 +737,59 @@ sqlite3 "$STAMP" 'SELECT count(*) FROM users;' > /tmp/opencode/before.txt
 sudo mv data/gamematch.db data/gamematch.db.pre-restore
 sudo rm -f data/gamematch.db-wal data/gamematch.db-shm
 sudo cp "$STAMP" data/gamematch.db
-sudo tar xzf "backups/photos-<stamp>.tar.gz" -C data
+# GUARDED: data/photos is absent on a fresh stack, so the archive is
+# legitimately missing and an unconditional tar exits 2 AFTER the database
+# has already been replaced. See "Five things" below.
+[ -f "backups/photos-<stamp>.tar.gz" ] && sudo tar xzf "backups/photos-<stamp>.tar.gz" -C data
 sudo chown -R 10001:10001 data
 docker compose start api
 sleep 4
 curl -sk -o /dev/null -w '%{http_code}\n' https://localhost/v1/healthz
 sqlite3 data/gamematch.db 'SELECT count(*) FROM users;' > /tmp/opencode/after.txt
 diff /tmp/opencode/before.txt /tmp/opencode/after.txt && echo "restore verified"
+sudo rm -rf data/gamematch.db.pre-restore data/photos.pre-restore   # once verified
 ```
 
 Expected: `200`, and `restore verified` — identical counts.
 
-Three things about this block as written above, all found during execution:
+Five things about this block as written above, all found during execution:
 
 - **`mv`, `cp` and `chown` inside `./data` need root.** `./data` is mode `0755`
   owned by UID 10001, so a non-root deploy user is refused with
   `Permission denied`. `sudo` is in the commands for that reason; the runbook
-  also records the throwaway-root-container equivalent.
+  also records the throwaway-root-container equivalent. **The systemd procedure
+  in `restore.md` had the same omission on `/var/lib/gamematch` and was fixed in
+  the same pass.**
 - **`sqlite3 data/gamematch.db …` after `stop api` fails** with
   `attempt to write a readonly database (8)`. `sqlite3` opens read-write, a WAL
   database needs its `-shm`, and a clean stop *deleted* that sidecar — so
   SQLite tries to create one in a directory the host user does not own. Verify
-  as root, or after `docker compose start api` has recreated the sidecars.
+  as root, after `docker compose start api` has recreated the sidecars, or from
+  the `backup` container, which answers either way.
 - **`diff` must compare like with like.** Redirecting the
   `PRAGMA integrity_check` output into `before.txt` alongside the user count
   makes the diff compare a two-line file with a one-line file, and it fails on a
   restore that worked. Let the integrity check print to the terminal.
+- **The photo archive has to be guarded and the live tree moved aside.** An
+  unconditional `tar` exits 2 on a fresh stack, after the database has been
+  replaced. Extracting over a live `data/photos` leaves every photo uploaded
+  *after* the snapshot as an orphan no database row references.
+- **The aside files have to be deleted afterwards.**
+  `gamematch.db.pre-restore` is a complete stale copy of the pre-restore
+  database, inside the directory the backup service archives from, and nothing
+  prunes it.
 
-The raw output of the drill, including all three of the failures above, is in
+One more trap, and the reason the drill must not be run by copying a command out
+of a stock image: **`alpine:3.24` has no `sqlite3` and no `bash`.** A throwaway
+container used to perform the privileged steps needs `apk add --no-cache sqlite`,
+and needs `set -e` — `sh -c` has none, so a failed step prints `sqlite3: not
+found`, exits 127, and the rest of the transcript is published anyway. This
+produced a plausible-looking `live users before restore: 6` line under a heading
+asserting the output was real, when no `sqlite3` had existed to print it. A
+restore transcript that cannot have come from its own command is worse than no
+transcript.
+
+The raw output of the drill, including all five failures above, is in
 `docs/runbooks/deploy-docker.md` Appendix B.3.
 
 - [ ] **Step 5: Commit**

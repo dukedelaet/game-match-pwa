@@ -123,11 +123,34 @@ corrupts the result.** Removing the sidecars is required, not optional.
    mv: cannot move 'data/gamematch.db' to 'data/gamematch.db.pre-restore': Permission denied
    ```
 
-4. **Restore the database and the photos.**
+4. **Restore the database, and the photos if there is an archive for it.**
 
    ```bash
    sudo cp "backups/gamematch-$STAMP.db" data/gamematch.db
-   sudo tar xzf "backups/photos-$STAMP.tar.gz" -C data
+
+   # The photos archive is GUARDED, and must be.
+   #
+   # `data/photos` does not exist on a fresh stack — only the photo upload
+   # handler creates it — so a snapshot taken early legitimately has no
+   # archive. Running `tar` unconditionally exits 2 on the missing file, and
+   # it does so AFTER step 3 has already replaced your database. You end up
+   # with a restored database and a non-zero exit code and no photos.
+   #
+   # The else branch is not just cosmetic: a missing archive on a stack that
+   # DOES have photos means data/photos was gone when the snapshot was taken,
+   # which is the silent database-only-backup failure. See "Where the
+   # backups come from" above.
+   if [ -f "backups/photos-$STAMP.tar.gz" ]; then
+       # Move the live tree aside, or every photo uploaded after the
+       # snapshot survives as an orphan no database row references.
+       [ -d data/photos ] && sudo mv data/photos data/photos.pre-restore
+       sudo tar xzf "backups/photos-$STAMP.tar.gz" -C data
+   else
+       echo "no photos archive for $STAMP"
+       echo "  either the snapshot predates the first upload, or data/photos"
+       echo "  was missing when it was taken -- check the backup listing"
+   fi
+
    sudo chown -R 10001:10001 data
    ```
 
@@ -175,9 +198,26 @@ corrupts the result.** Removing the sidecars is required, not optional.
    ```
 
    A last resort if the host cannot be trusted: copy the file somewhere readable
-   and query it there.
+   and query it there. The `backup` container also works at any point, with the
+   API up or down:
 
-7. **Take a fresh backup immediately**, so the restored state is protected again
+   ```bash
+   docker compose exec backup sqlite3 /data/gamematch.db 'PRAGMA journal_mode;'
+   ```
+
+7. **Clear the aside files.** Until you do, `./data` is holding a **complete
+   stale copy of the pre-restore database** plus the pre-restore photo tree,
+   inside the directory the backup service archives from — and nothing prunes
+   either.
+
+   ```bash
+   sudo rm -rf data/gamematch.db.pre-restore data/photos.pre-restore
+   ```
+
+   Do this only once the restore is verified. These files are the rollback, and
+   the rollback is worth exactly as much as the time you keep them for.
+
+8. **Take a fresh backup immediately**, so the restored state is protected again
    within one interval rather than six.
 
    ```bash
@@ -220,8 +260,14 @@ took effect rather than silently doing nothing.
 
 ## Procedure — systemd (legacy hosts)
 
-Identical reasoning, different paths and privileges. See
-[`deploy.md`](deploy.md) for how a legacy host is built.
+Identical reasoning, different paths. See [`deploy.md`](deploy.md) for how a
+legacy host is built.
+
+**Every `mv`, `rm`, `cp` and `chown` below needs `sudo`,** exactly as on the
+compose path. `DATA_DIR` is `/var/lib/gamematch`, created by
+`sudo install -d -o gamematch -g gamematch` and not writable by the deploy user;
+the `chown` calls only work as root in any case. This is the same ownership trap
+that was corrected on the compose path, and it is worth not repeating here.
 
 1. Stop the server so nothing is mid-write.
 
@@ -237,24 +283,29 @@ Identical reasoning, different paths and privileges. See
    BACKUP_DIR=/backup/gamematch
    STAMP=20261012T230000Z
 
-   mv "$DATA_DIR/gamematch.db" "$DATA_DIR/gamematch.db.old"
+   sudo mv "$DATA_DIR/gamematch.db" "$DATA_DIR/gamematch.db.old"
    # A -wal left beside a freshly restored database is replayed onto it and
    # corrupts the result. Removing the sidecars is required, not optional.
-   rm -f "$DATA_DIR/gamematch.db-wal" "$DATA_DIR/gamematch.db-shm"
+   sudo rm -f "$DATA_DIR/gamematch.db-wal" "$DATA_DIR/gamematch.db-shm"
    ```
 
 3. Restore the database:
 
    ```bash
-   cp "$BACKUP_DIR/gamematch-$STAMP.db" "$DATA_DIR/gamematch.db"
-   chown gamematch:gamematch "$DATA_DIR/gamematch.db"
+   sudo cp "$BACKUP_DIR/gamematch-$STAMP.db" "$DATA_DIR/gamematch.db"
+   sudo chown gamematch:gamematch "$DATA_DIR/gamematch.db"
    ```
 
-4. Restore photos:
+4. Restore photos — guarded, for the same reason as on the compose path:
 
    ```bash
-   tar xzf "$BACKUP_DIR/photos-$STAMP.tar.gz" -C "$DATA_DIR"
-   chown -R gamematch:gamematch "$DATA_DIR/photos"
+   if [ -f "$BACKUP_DIR/photos-$STAMP.tar.gz" ]; then
+       [ -d "$DATA_DIR/photos" ] && sudo mv "$DATA_DIR/photos" "$DATA_DIR/photos.old"
+       sudo tar xzf "$BACKUP_DIR/photos-$STAMP.tar.gz" -C "$DATA_DIR"
+   else
+       echo "no photos archive for $STAMP"
+   fi
+   sudo chown -R gamematch:gamematch "$DATA_DIR/photos"
    ```
 
 5. Start the server. Migrations run automatically on boot (the app applies any
@@ -267,10 +318,16 @@ Identical reasoning, different paths and privileges. See
 6. Verify. A restored database that opens is not necessarily the right one:
 
    ```bash
-   sqlite3 "$DATA_DIR/gamematch.db" 'PRAGMA integrity_check;'   # ok
-   sqlite3 "$DATA_DIR/gamematch.db" 'SELECT count(*) FROM users;'
-   sqlite3 "$DATA_DIR/gamematch.db" 'PRAGMA user_version;'
+   sudo sqlite3 "$DATA_DIR/gamematch.db" 'PRAGMA integrity_check;'   # ok
+   sudo sqlite3 "$DATA_DIR/gamematch.db" 'SELECT count(*) FROM users;'
+   sudo sqlite3 "$DATA_DIR/gamematch.db" 'PRAGMA user_version;'
    curl -fsS http://127.0.0.1:8000/v1/healthz
+   ```
+
+7. Clear the aside files once verified:
+
+   ```bash
+   sudo rm -rf "$DATA_DIR/gamematch.db.old" "$DATA_DIR/photos.old"
    ```
 
 ---

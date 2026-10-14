@@ -127,8 +127,41 @@ if [ -d "$DATA_DIR/photos" ]; then
 	mv "$PHOTOS_TMP" "$PHOTOS_OUT"
 fi
 
-# Keep 14 days. Runs hourly, so this is two weeks of history.
+# Keep 14 days. The interval is the caller's, not this script's: hourly from
+# gamematch-backup.timer, every 6 hours from the compose backup service. At
+# 6-hourly that is ~56 snapshots.
 find "$BACKUP_DIR" -name 'gamematch-*.db' -mtime +14 -delete
 find "$BACKUP_DIR" -name 'photos-*.tar.gz' -mtime +14 -delete
+
+# Sweep sidecars whose snapshot is gone.
+#
+# Reading a snapshot with sqlite3 leaves gamematch-<stamp>.db-shm (32K) and
+# .db-wal (0) beside it -- even with mode=ro, because a WAL database's index
+# lives in the shared-memory file. The two finds above match neither name, so
+# before this sweep those accumulated for the life of a deployment: ~46MB/year
+# across four runs a day, unbounded.
+#
+# The rule is ORPHANED, not OLD. A sidecar whose .db is still present belongs
+# to a snapshot that exists and may be being read right now, and it survives
+# however old it is -- age is the retention policy's business, already
+# applied above. Only once the .db itself is gone is the sidecar meaningless:
+# SQLite never creates a -shm without its database, so its absence is proof.
+#
+# After the two finds above rather than before, so a snapshot this run prunes
+# by age takes its sidecars with it in the same run.
+#
+# The globs do not cross '/', so this never reaches a concurrent run's
+# $TMP_DIR -- and it should not: that snapshot is mid-write and its sidecars
+# are removed by that run's own trap.
+for sidecar in "$BACKUP_DIR"/gamematch-*.db-shm "$BACKUP_DIR"/gamematch-*.db-wal; do
+	[ -e "$sidecar" ] || continue
+	case "$sidecar" in
+	*.db-shm) snapshot="${sidecar%.db-shm}.db" ;;
+	*.db-wal) snapshot="${sidecar%.db-wal}.db" ;;
+	esac
+	if [ ! -e "$snapshot" ]; then
+		rm -f "$sidecar"
+	fi
+done
 
 echo "backup: wrote $DB_OUT"

@@ -98,16 +98,12 @@ services:
   # Both run the same script; only the scheduler differs (hourly on the host,
   # every 6 hours here).
   #
-  # RESTORING IS NOT DOCUMENTED FOR THIS STACK YET. docs/runbooks/restore.md is
-  # the systemd runbook: it stops the server with `systemctl stop gamematch`
-  # and restores out of /var/lib/gamematch into /backup/gamematch. For this
-  # stack those are `docker compose stop api`, ./data and ./backups, and the
-  # api runs as uid 10001 rather than the gamematch user. Its REASONING still
-  # applies unchanged — why .backup and not cp, why the -wal sidecar must be
-  # deleted before a restore — but its commands do not, and following them here
-  # would restore from a directory this stack never writes to. Task 7 rewrites
-  # that runbook; until then read it for the argument and take the paths from
-  # this file.
+  # RESTORING: docs/runbooks/restore.md, section "Procedure — Docker Compose".
+  # The paths here are ./data and ./backups, the stop is `docker compose stop
+  # api`, and the api runs as uid 10001 rather than the gamematch user, so that
+  # runbook's systemd section does not apply to this stack. Its reasoning does —
+  # why .backup and not cp, why the -wal sidecar must be deleted before a
+  # restore — and it is shared by both procedures.
   backup:
     image: alpine:3.24
     # DATA_DIR is not optional here. The script's built-in default is
