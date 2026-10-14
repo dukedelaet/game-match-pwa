@@ -663,7 +663,29 @@ correctly exits non-zero naming it."
 
 Local test flow, then VPS deploy. The VPS section must include, in order: clone, `cp .env.example .env`, fill in the production variables, `mkdir -p data backups && chown -R 10001:10001 data`, `docker compose up --build -d`. State that DNS must point at the host **before** first start so Caddy can obtain a certificate.
 
+Two steps belong between `chown` and `up --build -d`, both found in Task 5 and Task 6:
+
+- **`pnpm install && pnpm --filter web build`**, because `apps/web/dist` is
+  gitignored and the web image copies it without building. A clean clone fails
+  the build with `"/apps/web/dist": not found`.
+- **Filling in `.env` by swapping blocks, not by editing `APP_ENV`.** The order
+  above is preserved: the transformation belongs in "fill in the production
+  variables", which is where it is. `.env.example` documents it and it is
+  published as two tested `sed` commands — the `sed` in Task 6 step 1 is the
+  thing that produced the `DEV_OTP` crash loop.
+
 Include a troubleshooting table keyed to the failures this stack actually produces: API unreachable through Caddy (`ADDR` left at loopback), permission denied on `./data` (UID), Caddy certificate failure (DNS not yet pointed), and a database that will not open (filesystem without WAL support).
+
+Beyond the four the plan names, the rows this stack actually produced during
+Tasks 4–6: `server misbehaving` from Docker's embedded DNS while `api`
+crash-loops (which is *not* `connection refused`, and editing `GAMEMATCH_API`
+fixes nothing); `docker compose ps` reporting a crash loop as
+`Up 1 second (health: starting)`; `.State.ExitCode` reading `0` during a crash
+loop; `otp/start` returning `{"ok":true}` and storing nothing once a
+*persisted* rate limit is hit; a missing `data/photos` making every backup
+silently database-only while the container stays `healthy`; `caddy reload`
+failing because the Caddyfile sets `admin off`; and `env: can't execute 'bash'`
+from a manual backup run with `--entrypoint sh`.
 
 - [ ] **Step 2: Repoint `deploy.md`**
 
@@ -673,24 +695,64 @@ Mark the systemd path as legacy and link the Docker runbook as supported. Keep t
 
 The `rm -f "$DATA_DIR"/gamematch.db-{wal,shm}` step becomes `docker compose stop api` first, so no live process rewrites the sidecars mid-restore. Keep the existing warning about not copying a live `.db`.
 
+Two corrections found while executing this step, both now in `restore.md`:
+
+1. **The recovery point objective is up to 6 hours, not 1.** This file says 6
+   hours at lines 7 and 340 and the design spec agrees, but `restore.md` still
+   claimed hourly and a 1-hour RPO because it described the systemd timer. The
+   two cadences must both be stated, per deployment, or the reader cannot tell
+   which one applies to them.
+2. **A manual backup must not be run via `--entrypoint sh`.** That bypasses the
+   `apk add bash sqlite` in the service's `command:` and fails with
+   `env: can't execute 'bash': No such file or directory` (rc 127). The runbook
+   uses `docker compose exec backup /scripts/backup.sh /backups`.
+
 - [ ] **Step 4: Verify the restore actually works**
+
+Run against a stack that has rows worth losing (`docker compose run --rm api
+seed`, then sign in through `/v1/auth/otp/*` and upload a photo). **Pin `STAMP`
+to a snapshot taken before the last sign-in.** `ls -t | head -1` picks the
+*newest* snapshot, which is normally the one taken most recently — and restoring
+it returns a count equal to the live one, so the drill proves nothing. Restoring
+an older snapshot must visibly *lose* the rows written after it.
 
 ```bash
 docker compose stop api
-STAMP="$(ls -t backups/gamematch-*.db | head -1)"
+STAMP=backups/gamematch-<older-stamp>.db
+sqlite3 "$STAMP" 'PRAGMA integrity_check;'                      # ok
 sqlite3 "$STAMP" 'SELECT count(*) FROM users;' > /tmp/opencode/before.txt
-mv data/gamematch.db data/gamematch.db.pre-restore
-rm -f data/gamematch.db-wal data/gamematch.db-shm
-cp "$STAMP" data/gamematch.db
-chown 10001:10001 data/gamematch.db
+sudo mv data/gamematch.db data/gamematch.db.pre-restore
+sudo rm -f data/gamematch.db-wal data/gamematch.db-shm
+sudo cp "$STAMP" data/gamematch.db
+sudo tar xzf "backups/photos-<stamp>.tar.gz" -C data
+sudo chown -R 10001:10001 data
 docker compose start api
-sleep 3
+sleep 4
 curl -sk -o /dev/null -w '%{http_code}\n' https://localhost/v1/healthz
 sqlite3 data/gamematch.db 'SELECT count(*) FROM users;' > /tmp/opencode/after.txt
 diff /tmp/opencode/before.txt /tmp/opencode/after.txt && echo "restore verified"
 ```
 
-Expected: `200`, and `restore verified` — identical counts. A mismatch means the restore lost committed data, which is precisely the WAL failure `restore.md` warns about.
+Expected: `200`, and `restore verified` — identical counts.
+
+Three things about this block as written above, all found during execution:
+
+- **`mv`, `cp` and `chown` inside `./data` need root.** `./data` is mode `0755`
+  owned by UID 10001, so a non-root deploy user is refused with
+  `Permission denied`. `sudo` is in the commands for that reason; the runbook
+  also records the throwaway-root-container equivalent.
+- **`sqlite3 data/gamematch.db …` after `stop api` fails** with
+  `attempt to write a readonly database (8)`. `sqlite3` opens read-write, a WAL
+  database needs its `-shm`, and a clean stop *deleted* that sidecar — so
+  SQLite tries to create one in a directory the host user does not own. Verify
+  as root, or after `docker compose start api` has recreated the sidecars.
+- **`diff` must compare like with like.** Redirecting the
+  `PRAGMA integrity_check` output into `before.txt` alongside the user count
+  makes the diff compare a two-line file with a one-line file, and it fails on a
+  restore that worked. Let the integrity check print to the terminal.
+
+The raw output of the drill, including all three of the failures above, is in
+`docs/runbooks/deploy-docker.md` Appendix B.3.
 
 - [ ] **Step 5: Commit**
 

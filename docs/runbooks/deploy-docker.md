@@ -1,13 +1,602 @@
 # Docker deployment
 
-> **Status: partial.** This file currently holds verification evidence recorded by
-> the deployment plan — Task 5's *verified on local Docker* walkthrough and
-> Task 6's *verified: production boot path* — and nothing else. The full runbook —
-> the local test flow, the VPS deploy procedure, and the troubleshooting table —
-> is Task 7 and is not written yet. Until it is, `deploy.md` is still the only
-> complete deploy procedure in this repo, and it is the systemd path.
+> **Status: this is the supported deployment path for GameMatch.** One compose
+> file, three services, one `.env`. `docs/runbooks/deploy.md` documents the older
+> systemd deployment and is kept for hosts already running it — do not start a
+> new VPS from it.
+>
+> Every command in this document is copy-pasteable. Every block labelled
+> **Verified** is real terminal output captured against this stack on 2026-10-14,
+> not a paraphrase; the evidence is in [Appendix A](#appendix-a--verification-evidence)
+> and [Appendix B](#appendix-b--verification-evidence-continued).
 
-## Verified on local Docker
+## Contents
+
+- [What runs](#what-runs)
+- [Deploying to a VPS](#deploying-to-a-vps)
+- [Verifying the deploy](#verifying-the-deploy)
+- [Updating a deployment](#updating-a-deployment)
+- [Backups](#backups)
+- [Restoring](#restoring)
+- [Troubleshooting](#troubleshooting)
+- [Appendix A — verification evidence](#appendix-a--verification-evidence)
+- [Appendix B — verification evidence (continued)](#appendix-b--verification-evidence-continued)
+
+## What runs
+
+Three services, defined in `docker-compose.yml`:
+
+| Service | Image | Exposed | Does |
+| --- | --- | --- | --- |
+| `api` | `gamematch-api:latest` | **nothing** — no `ports:` mapping, reachable only on the compose network | The Go binary. SQLite at `/data/gamematch.db`, photos at `/data/photos`, UID 10001. |
+| `web` | `gamematch-web:latest` | `80`, `443` (from `HTTP_PORT`/`HTTPS_PORT`) | Caddy. Terminates TLS, serves `apps/web/dist`, reverse-proxies `/v1` to `api:8000`. |
+| `backup` | `alpine:3.24` | nothing | Runs the existing `scripts/backup.sh` once on start and then every 6 hours. |
+
+```
+browser ──TLS──> Caddy (web) ─┬── /v1/* ──> api:8000
+                               └── /*    ──> apps/web/dist
+                                        ▲
+host ./data  ──bind mount──> /data in api and backup
+host ./backups ──bind mount──> /backups in backup
+```
+
+Two things follow from that diagram and both are load-bearing:
+
+- **The `api` service must never publish a port.** It binds `0.0.0.0` inside its
+  container because a container's loopback is its own — Caddy is a different
+  container and could never reach `127.0.0.1:8000` there. The exposure that
+  creates is contained by *not* publishing it. A `ports:` line under `api` would
+  put the API on the host's public interface with no TLS and none of the security
+  headers in `deploy/Caddyfile`.
+- **All durable state is on the host**, in `./data` and `./backups`. The three
+  named volumes (`caddy-data`, `caddy-config`, `caddy-logs`) hold only Caddy's
+  certificates, autosaved config and access log. `docker compose down` keeps
+  everything on the host; `docker compose down -v` deletes the certificates —
+  **do not use `-v`**, see [Backups](#backups).
+
+---
+
+## Deploying to a VPS
+
+### Before you start
+
+You need all of these before the first `docker compose up`:
+
+- **A host with Docker Engine and the Compose plugin.** `docker compose version`
+  must work. This runbook uses the `docker compose` (v2) syntax throughout.
+- **git**, and outbound network access to GitHub and to the Docker Hub.
+- **Node and pnpm**, to build the PWA. `mise.toml` pins Node 24 and pnpm 12.9.1
+  at the repo root, so `mise install` is the shortest way to get the versions
+  this repo was built with. `apps/web/Dockerfile` copies `apps/web/dist/` and
+  **builds nothing** — see [Step 5](#5-build-the-pwa-on-the-host).
+- **A domain, with DNS already pointing at this host's public IP.** This is the
+  one prerequisite that is easy to get wrong and produces the most confusing
+  failure. Caddy obtains its TLS certificate on first start, so the A/AAAA record
+  must resolve to this host *before* you start the stack. Point the record at the
+  host's IPv4 now, and wait for it to propagate. Confirm:
+
+  ```bash
+  getent hosts your.domain        # must print this host's public IP
+  ```
+
+  If it prints nothing, stop and wait. Registrars and resolvers cache, and this
+  can take up to an hour. Caddy does keep retrying in the background — it will
+  pick the certificate up once DNS resolves, without a restart — but the site is
+  completely unusable until it does: `:80` answers `308` to an HTTPS that cannot
+  complete, and there is no plain-HTTP fallback. See the certificate row in
+  [Troubleshooting](#troubleshooting).
+- **Inbound TCP ports 80 and 443 open** in the host firewall and any security
+  group in front of it. Both are published by the `web` service. TCP 443/UDP is
+  optional (Caddy will offer HTTP/3); TCP 80 is required even if you never use
+  plain HTTP, because Caddy answers it with a redirect to HTTPS.
+- **Outbound TCP 443 to the alpine package mirrors.** The `backup` container runs
+  `apk add --no-cache bash sqlite` on *every* start, not at build time. A host
+  that blocks it gets a crash-restarting backup container and no backups.
+
+### 1. Get the code
+
+```bash
+git clone https://github.com/dukedelaet/game-match-pwa.git
+cd game-match-pwa
+```
+
+### 2. Create `.env`
+
+```bash
+cp .env.example .env
+```
+
+`.env` is gitignored. `.env.example` is the committed template and holds **two
+complete configurations** — a local one and a VPS one — so there is nothing else
+to look up. `.env` is the only file you change between a laptop and a server.
+
+### 3. Fill in the production variables
+
+**Do not hand-edit `APP_ENV` and leave the rest of the local block in place.**
+That is the single most common way this deploy fails, and it fails on the first
+boot rather than halfway through the deploy. `.env.example`'s own instructions
+(lines 7–8) are: *comment out every line of the local block, then uncomment every
+line of the VPS block except `DEV_OTP`.* Here that is as two `sed` commands:
+
+```bash
+# 1. comment out every active line — that is the whole local block
+sed -i 's|^\([A-Z][A-Z_0-9]*=\)|#\1|' .env
+
+# 2. uncomment the VPS block, leaving DEV_OTP and the optional web-push block alone
+sed -i '/^# --- VPS:/,/^# --- optional:/{/^#DEV_OTP=/!{/^#[A-Z][A-Z_0-9]*=/s/^#//}}' .env
+```
+
+The result:
+
+```
+# --- local: this machine (APP_ENV=local) -----------------------------------
+#GAMEMATCH_SITE=localhost
+#HTTP_PORT=80
+#HTTPS_PORT=443
+#APP_ENV=local
+#APP_DEBUG=true
+#DEV_OTP=123456
+#HOUSE_USER_ID=00000000-0000-4000-8000-000000000001
+...
+# --- VPS: public host (APP_ENV=production) ----------------------------------
+APP_ENV=production
+GAMEMATCH_SITE=gamematch.example.com
+HTTP_PORT=80
+HTTPS_PORT=443
+APP_DEBUG=false
+#DEV_OTP=
+SMS_PROVIDER=twilio
+TWILIO_ACCOUNT_SID=
+TWILIO_AUTH_TOKEN=
+TWILIO_FROM=
+TURNSTILE_SECRET=
+HOUSE_USER_ID=00000000-0000-4000-8000-000000000001
+```
+
+Two details in that `sed` are worth stating because getting them wrong is what
+breaks the boot:
+
+- **The delimiter is `|`, not `/`.** `sed 's/^X=/\/#\1/'` does *not* insert a
+  `#` — GNU sed treats `\#` specially and you get a literal `/#` on every line.
+  Verified:
+  ```
+  $ printf 'A=1\nB=2\n' | sed 's/^\([A-Z][A-Z_0-9]*=\)/\/#\1/'
+  /#A=1
+  /#B=2
+  $ printf 'A=1\nB=2\n' | sed 's|^\([A-Z][A-Z_0-9]*=\)|#\1|'
+  #A=1
+  #B=2
+  ```
+- **`DEV_OTP` stays commented.** `.env.example` ships `DEV_OTP=123456`
+  *uncommented* in the local block, and `Config.Validate()` refuses to boot a
+  production process that has any `DEV_OTP` at all
+  (`apps/server/internal/config/config.go:126-128`). If you only flip `APP_ENV`
+  instead of swapping blocks, the API crash-loops with
+  `config: unsafe production configuration: DEV_OTP` and the site shows a 502
+  on every API call. See the `DEV_OTP` row in [Troubleshooting](#troubleshooting).
+
+Now edit the values. `nano .env` (or your editor of choice):
+
+| Line | What to put in it |
+| --- | --- |
+| `GAMEMATCH_SITE` | **Your real domain.** Left as `gamematch.example.com`, Caddy requests a certificate for a domain you do not own and every visitor gets a name mismatch. |
+| `TWILIO_ACCOUNT_SID` | From the Twilio console. Must start with `AC`. |
+| `TWILIO_AUTH_TOKEN` | From the Twilio console. |
+| `TWILIO_FROM` | Your Twilio number in E.164 form, e.g. `+15550000000`. |
+| `TURNSTILE_SECRET` | The **secret** key from Cloudflare Turnstile, not the site key. |
+| `VAPID_*` (optional) | Only if you want web push. Generate a pair with `docker compose run --rm api vapid`. |
+
+`APP_ENV=production` is the guardrail that matters most: outside production,
+`Config.Validate()` returns immediately, so a VPS configured with a real domain
+but without it starts happily, serves a real Let's Encrypt certificate, and then
+**every sign-in fails silently** — codes are generated and thrown away instead of
+being sent. With `APP_ENV=production` set, the server refuses to boot and *names*
+each variable it is missing, so you can fill them in at your own pace.
+
+Check the file before going further. Only the production block should be active:
+
+```bash
+grep -E '^[A-Z]' .env
+```
+
+Anything printed twice, or any line from the local block still uncommented, is a
+mistake. Then confirm the credentials are filled in and `DEV_OTP` is gone:
+
+```bash
+# names of the four required credentials — a fifth line here means the local
+# block's DEV_OTP=123456 survived, which is the crash loop below
+grep -E '^(TWILIO_ACCOUNT_SID|TWILIO_AUTH_TOKEN|TWILIO_FROM|TURNSTILE_SECRET|DEV_OTP)=' .env
+
+# anything still empty; no output means all four are set
+grep -E '^(TWILIO_ACCOUNT_SID|TWILIO_AUTH_TOKEN|TWILIO_FROM|TURNSTILE_SECRET)=' .env | grep -E '=$'
+```
+
+```
+TWILIO_ACCOUNT_SID=
+TWILIO_AUTH_TOKEN=
+TWILIO_FROM=
+TURNSTILE_SECRET=
+```
+
+Four lines, and no `DEV_OTP`. The second command prints nothing at that point
+because the values have not been filled in yet — it is what you run *after*
+editing, and it is the check that catches a forgotten one. `Config.Validate()`
+names a missing variable at boot, but only the first one per start, and the
+container crash-loops until you fix it.
+
+If you prefer to append rather than edit in place, note that the last occurrence
+of a duplicated key wins, so appending is safe — verified, the container
+received `TWILIO_ACCOUNT_SID=ACplaceholder` from an appended line that followed
+an empty `TWILIO_ACCOUNT_SID=`.
+
+### 4. Create the data and backups directories
+
+```bash
+mkdir -p data backups
+sudo chown -R 10001:10001 data
+```
+
+The API container runs as **UID 10001**, non-root. It cannot write a database
+into a host directory it does not own, and the failure names neither the path nor
+the UID. `./backups` stays owned by your deploy user: the `backup` container runs
+as root, so it can write there regardless.
+
+If you would rather not use `sudo`, a throwaway root container does the same
+thing and needs no host credential:
+
+```bash
+docker run --rm -v "$PWD/data:/data" alpine:3.24 chown -R 10001:10001 /data
+```
+
+Check it, before the first start:
+
+```bash
+ls -ldn data          # 10001 10001
+```
+
+### 5. Build the PWA on the host
+
+```bash
+pnpm install
+pnpm --filter web build
+```
+
+**This step is required and is not optional.** `apps/web/Dockerfile:21` is
+`COPY apps/web/dist/ /srv/dist/` and the web image builds nothing. `apps/web/dist`
+is gitignored, so on a fresh clone it does not exist and the build below fails:
+
+```
+$ docker compose build web
+#9 ERROR: failed to calculate checksum of ref ttzdq1zuskb4fffb3vjrx7fvr::k5yikmgyagrsntt5zt60fxwg9: "/apps/web/dist": not found
+ > [2/3] COPY apps/web/dist/ /srv/dist/:
+Dockerfile:21
+failed to solve: failed to compute cache key: failed to calculate checksum of ref ttzdq1zuskb4fffb3vjrx7fvr::k5yikmgyagrsntt5zt60fxwg9: "/apps/web/dist": not found
+```
+
+This step is also the frontend deploy. The image ships whatever `dist/` contained
+when you built it — a PWA change is `pnpm --filter web build` followed by a
+`web` restart, with no API rebuild.
+
+### 6. Start the stack
+
+```bash
+docker compose up --build -d
+```
+
+```
+ Volume gamematch_caddy-logs Creating
+ Volume gamematch_caddy-data Creating
+ Volume gamematch_caddy-config Created
+ Volume gamematch_caddy-logs Created
+ Volume gamematch_caddy-data Created
+ Network gamematch_default Created
+ Container gamematch-api-1 Creating
+ Container gamematch-api-1 Created
+ Container gamematch-web-1 Creating
+ Container gamematch-backup-1 Creating
+ Container gamematch-web-1 Created
+ Container gamematch-backup-1 Created
+ Container gamematch-api-1 Starting
+ Container gamematch-api-1 Started
+ Container gamematch-api-1 Waiting
+ Container gamematch-backup-1 Starting
+ Container gamematch-backup-1 Started
+ Container gamematch-api-1 Healthy
+ Container gamematch-web-1 Starting
+ Container gamematch-web-1 Started
+```
+
+(Docker interleaves each progress line twice on a TTY; the duplicates are dropped
+above. Nothing else is.)
+
+`api` goes `Healthy` before `web` starts (`web` declares
+`depends_on: api: condition: service_healthy`), so by the time Caddy is listening
+the proxy upstream exists.
+
+First deploy only — create the demo users, so the site is not empty:
+
+```bash
+docker compose run --rm api seed
+2026/10/14 22:28:40 seeded /data/gamematch.db
+```
+
+`seed` is idempotent: re-running it re-seeds over an existing database without
+complaint. On a public host you may prefer an empty database instead — the
+command is optional and skipping it just means no demo data.
+
+### 7. First things to check
+
+```bash
+docker compose ps
+docker inspect --format '{{.RestartCount}}' gamematch-api-1     # must be 0
+docker compose logs api | tail -5
+```
+
+```
+NAME                 IMAGE                  COMMAND                  SERVICE   CREATED          STATUS                    PORTS
+gamematch-api-1      gamematch-api:latest   "/usr/local/bin/game…"   api       24 seconds ago   Up 14 seconds (healthy)   8000/tcp
+gamematch-backup-1   alpine:3.24            "sh -c 'apk add --no…"   backup    6 minutes ago    Up 6 minutes (healthy)    
+gamematch-web-1      gamematch-web:latest   "caddy run --config …"   web       19 seconds ago   Up 10 seconds             0.0.0.0:80->80/tcp, [::]:80->80/tcp, 0.0.0.0:443->443/tcp, [::]:443->443/tcp, 443/udp, 2019/tcp
+
+$ docker inspect --format '{{.RestartCount}}' gamematch-api-1
+0
+
+$ docker compose logs api | tail -3
+api-1  | 2026/10/14 22:34:28 gamematch listening on http://0.0.0.0:8000 (data dir /data, debug=false)
+api-1  | 2026/10/14 22:34:30 GET /v1/healthz 200 0s
+```
+
+Three things to read off that:
+
+1. **`RestartCount` is 0.** This — not `docker compose ps` and not
+   `.State.ExitCode` — is the check that cannot be misread. See
+   [Troubleshooting](#troubleshooting).
+2. **`debug=false`** in the boot line. `APP_ENV=local` would print `debug=true`,
+   and `APP_DEBUG=true` in production makes every one-time code the constant
+   `123456` and returns it in the API response, so anyone who can reach the site
+   can sign in as any phone number.
+3. **`backup` shows `health: starting` for the first few minutes and that is
+   normal.** It runs `apk add`, then `sleep 30`, then takes its first backup. The
+   healthcheck has a 180s start period for exactly this. Confirm it lands:
+
+   ```bash
+   ls -l backups/
+   docker compose ps backup
+   ```
+
+   ```
+   -rw-r--r-- 1 root root 516096 Oct 14 22:29 gamematch-20261014T222905Z.db
+   -rw-r--r-- 1 root root   8984 Oct 14 22:29 photos-20261014T222905Z.tar.gz
+   ```
+
+   A `.db` and, once photos exist, a `photos-*.tar.gz`. See
+   [Backups](#backups) for what a missing photos archive means.
+
+Then, from outside:
+
+```bash
+curl -fsS https://your.domain/v1/healthz      # {"ok":true}
+curl -fsSI https://your.domain/boot | head -1 # HTTP/2 200
+```
+
+And confirm the API is *not* reachable on the host, which is the property the
+whole design exists to protect:
+
+```bash
+docker compose ps --format '{{.Service}} {{.Ports}}'
+curl -s -o /dev/null -w '%{http_code}\n' --max-time 3 http://127.0.0.1:8000/v1/healthz
+```
+
+```
+$ docker compose ps --format '{{.Service}} {{.Ports}}'
+api 8000/tcp
+backup
+web 0.0.0.0:80->80/tcp, [::]:80->80/tcp, 0.0.0.0:443->443/tcp, [::]:443->443/tcp, 443/udp, 2019/tcp
+
+$ curl -s -o /dev/null -w '%{http_code}\n' --max-time 3 http://127.0.0.1:8000/v1/healthz
+000
+
+$ docker compose exec web wget -qO- http://api:8000/v1/healthz
+{"ok":true}
+```
+
+`000` is connection refused. The `wget` from inside the `web` container is there
+so that `000` cannot be mistaken for a dead API — the API is reachable, just not
+from outside the compose network. If the host-level probe ever returns `200`,
+something has added a `ports:` mapping to the `api` service — stop and fix it
+before the host is exposed to the internet.
+
+Finally, **try signing in from a real phone.** That is the only check that
+exercises Twilio and Turnstile together, and it is the one that catches wrong
+credentials — the API answers `{"ok":true}` and logs the send failure rather
+than surfacing it to the user.
+
+---
+
+## Verifying the deploy
+
+`docker compose ps` output and the checks that can be run against a live stack
+are in [Appendix A](#appendix-a--verification-evidence). The short form:
+
+| Check | Command | Expected |
+| --- | --- | --- |
+| API is up and staying up | `docker inspect --format '{{.RestartCount}}' gamematch-api-1` | `0` |
+| API reached through TLS | `curl -fsS https://your.domain/v1/healthz` | `{"ok":true}` |
+| PWA served | `curl -fsSI https://your.domain/boot \| head -1` | `HTTP/2 200` |
+| SPA fallback works | `curl -fsS -o /dev/null -w '%{http_code}\n' https://your.domain/deep/spa/route` | `200` |
+| Security headers present | see Appendix A step 6 | `1` each |
+| API not exposed on the host | `curl -s -o /dev/null -w '%{http_code}\n' --max-time 3 http://127.0.0.1:8000/v1/healthz` | `000` |
+| Data directory ownership | `docker compose exec api ls -ldn /data` | `10001 10001` |
+| WAL is actually in use | `sqlite3 data/gamematch.db 'PRAGMA journal_mode;'` | `wal` |
+| Backups are landing | `ls -l backups/` | a new `.db` every 6h |
+
+---
+
+## Updating a deployment
+
+```bash
+git pull
+pnpm --filter web build        # only if the frontend changed
+docker compose up --build -d
+```
+
+- A frontend-only change: `pnpm --filter web build && docker compose up -d --build web`.
+  The web image builds nothing; it copies `dist/`.
+- An API change: `docker compose up -d --build api`. `web` needs no restart — it
+  reverse-proxies to the service name `api:8000`, which Docker's embedded DNS
+  re-resolves when the container is recreated, so the new binary is picked up by
+  the next request.
+- A configuration change: edit `.env`, then `docker compose up -d --force-recreate
+  api`. Compose only recreates a container when the file's *hash* changes, so a
+  `sed` that edits a value Compose does not track (or one it tracks under a
+  different name) needs the explicit `--force-recreate`.
+
+Migrations run automatically on boot from the embedded set, keyed on
+`PRAGMA user_version`. There is no migration step to remember, and no way to run
+one without starting the service.
+
+Rolling back a bad deploy is `git checkout <previous-sha>`, rebuild, `up -d`.
+The schema does not go backwards, so roll *forward* with a new migration rather
+than expecting an old binary to run against a newer schema.
+
+---
+
+## Backups
+
+The `backup` service runs the existing `scripts/backup.sh`: **once shortly after
+start, and then every 6 hours** (`sleep 21600` plus the duration of the run
+itself). Each run writes `gamematch-<stamp>.db` and, when `data/photos` exists,
+`photos-<stamp>.tar.gz` into `./backups`, and prunes anything older than 14 days.
+
+| Property | Value |
+| --- | --- |
+| Interval | 6 hours (not hourly — that is the systemd timer in `deploy.md`) |
+| Recovery point objective | **up to 6 hours** of lost writes, plus the duration of a run |
+| Retention | 14 days (`-mtime +14`), so roughly 56 snapshots |
+| Health signal | `backup` reports `unhealthy` when the newest `.db` is more than 7 hours old |
+| Location | `./backups` on the host — **the same disk as the database** |
+
+Two operational consequences:
+
+- **`./backups` is on the same host as `./data`.** A disk failure takes both.
+  Copy them off-box (`rsync`, `restic`, whatever you already run) or the backups
+  buy you nothing against the failure they exist for.
+- **Do not run `docker compose down -v`.** It does not touch `./data` or
+  `./backups` — both are bind mounts — but it *does* delete `caddy-data`, the
+  ACME account and every certificate. The next `up` re-requests them, and Let's
+  Encrypt permits 5 duplicate certificates per week per registered domain, which
+  is enough to lock the domain out for the rest of the week. Plain
+  `docker compose down` is safe.
+
+Take a backup on demand, without waiting for the schedule:
+
+```bash
+docker compose exec backup /scripts/backup.sh /backups
+```
+
+```
+backup: wrote /backups/gamematch-20261014T222944Z.db
+```
+
+Run it through the **service's own entry point**. Overriding the entry point
+replaces the service's `command:` — which is where `apk add bash sqlite` lives —
+and the script's `#!/usr/bin/env bash` shebang then has nothing to run:
+
+```
+$ docker compose run --rm --entrypoint /scripts/backup.sh backup /backups
+env: can't execute 'bash': No such file or directory
+rc=127
+```
+
+To take a snapshot from a stopped stack instead, start the stack first — the
+backup container is what has `sqlite3` on it.
+
+**A missing `photos-*.tar.gz` is the failure to watch for.** `scripts/backup.sh`
+guards the archive with `if [ -d "$DATA_DIR/photos" ]` and otherwise does
+nothing at all: no warning, exit 0, a valid `.db` written as usual, and the
+container stays `healthy`, because the healthcheck only looks at `.db` files. If
+the photos directory is ever deleted, restored from the wrong place, or left
+unmounted by a bind-mount typo, **every subsequent backup is silently
+database-only, every 6 hours, indefinitely.** The database keeps its photo rows,
+so nothing in the app breaks; the loss only surfaces at the point of recovery.
+
+`data/photos` does not exist on a fresh stack and that is benign — it is created
+by the first photo upload. What is *not* benign is it disappearing later. Check
+it alongside your backup listing.
+
+---
+
+## Restoring
+
+Full procedure, with the reasoning it rests on, in
+[`restore.md`](restore.md). The shape of it, for the compose stack:
+
+```bash
+docker compose stop api          # nothing may write while you restore
+sudo mv data/gamematch.db data/gamematch.db.pre-restore
+sudo rm -f data/gamematch.db-wal data/gamematch.db-shm
+sudo cp backups/gamematch-<stamp>.db data/gamematch.db
+sudo tar xzf backups/photos-<stamp>.tar.gz -C data
+sudo chown -R 10001:10001 data
+docker compose start api
+```
+
+Three things about that sequence that are specific to this stack:
+
+1. **Stop the API first.** A live process rewrites the WAL sidecars mid-restore,
+   and a `-wal` left beside a freshly restored database is replayed onto it.
+2. **`chown -R 10001:10001 data`, not just the `.db`.** The extracted photos
+   directory comes back root-owned unless you do.
+3. **Verify as root, or after the API is back up.** `sqlite3 <file> 'SELECT ...'`
+   opens read-write by default, and with the API stopped there is no `-shm` side
+   car for it to use, so a plain host-side query fails:
+   ```
+   $ sqlite3 data/gamematch.db 'SELECT count(*) FROM users;'
+   Parse error in 2nd command line argument: attempt to write a readonly database (8)
+   ```
+   Once `docker compose start api` has run, the sidecars exist and the same
+   query works.
+
+---
+
+## Troubleshooting
+
+Each row is a failure this stack actually produces, with the evidence behind it
+in the appendix.
+
+| Symptom | Cause | How to confirm | Fix |
+| --- | --- | --- | --- |
+| **The PWA loads but every API call is 502.** The site "works" — `/` returns `200` — and the whole backend is down. | The `api` container is crash-looping on `Config.Validate()`. Because of `restart: unless-stopped` it never rests in `Exited`, so a single `docker compose ps` sample usually reads `Up 1 second (health: starting)`, which looks like a normal start. | `docker compose logs api \| tail -20` — the message **names the missing variable**. `docker inspect --format '{{.RestartCount}}' gamematch-api-1` is non-zero and climbing. | Fill in the variable it names and `docker compose up -d --force-recreate api`. See the `.env` section. |
+| **`config: unsafe production configuration: DEV_OTP`** | `.env.example`'s local block ships `DEV_OTP=123456` uncommented. Switching only `APP_ENV` leaves it set, and `Validate()` refuses any non-empty `DEV_OTP` in production (`internal/config/config.go:126-128`). | `docker compose logs api \| tail -5` | Do not hand-edit `APP_ENV`. Use the two `sed` commands in [step 3](#3-fill-in-the-production-variables), which comment the whole local block out. |
+| **Caddy's log says `server misbehaving`, not `connection refused`.** | Docker's embedded DNS failing to resolve `api`, because the `api` container is being torn down and recreated constantly. Editing `GAMEMATCH_API` will fix nothing. | `docker compose logs web \| grep 'server misbehaving'` — the same signature as the row above, and a different cause. | Fix the crash loop above. |
+| **`docker compose ps` says `Up 1 second (health: starting)` but the service is dying.** | A sample of a crash loop, caught mid-cycle. | Sample it repeatedly, or read `RestartCount`. | Read the log. |
+| **You reach for `.State.ExitCode` to check a crash and it reads `0`.** | It resets to `0` on every restart, so during a crash loop it reads `0` once per cycle, in the window before `Validate()` kills the process again. On a healthy boot it is also `0`, so the two cases are indistinguishable — a worse misread than `ps`, because `0` looks definitive. | Measured: 7 of the first 50 samples were `0` during a crash loop. | Use `docker inspect --format '{{.RestartCount}}' gamematch-api-1`. Monotonic, and non-zero after any failed deploy. |
+| **Permission denied writing the database; the API dies on boot.** | `./data` is not owned by UID 10001. The image runs non-root and the message names neither the host path nor the UID. | `ls -ldn data`; `docker compose exec api ls -ldn /data` — both must be `10001 10001` | `sudo chown -R 10001:10001 data` |
+| **`curl https://your.domain/…` fails with `curl: (35) TLS connect error`.** Plain HTTP still answers `308 Permanent Redirect` to an HTTPS that cannot complete, so "the redirect works" is not a good sign. | Caddy could not obtain a certificate — usually because DNS was pointed at the host *after* the first start, or 80/443 is firewalled, or `GAMEMATCH_SITE` is still the `gamematch.example.com` placeholder. | `docker compose logs web \| grep tls.obtain` | Point the A/AAAA record at this host and **confirm it resolves from here** (`getent hosts your.domain`) before restarting. Caddy retries on its own — `will retry … retrying_in: 60 … max_duration: 2592000`, i.e. 30 days — so `docker compose restart web` will pick it up immediately but is not required once DNS resolves. On a real domain the CA's error differs: a name that does not resolve fails at the HTTP-01 challenge step, not at order creation. |
+| **`docker compose build web` fails with `"/apps/web/dist": not found`.** | `apps/web/dist` is gitignored and the web image copies it without building it. | The error names the `COPY` line. | `pnpm install && pnpm --filter web build`, then rebuild. |
+| **Every call through Caddy 502s, but the API container is healthy.** | `ADDR` was set to `127.0.0.1:8000` — from a stray `ADDR=` line in `.env`. Container loopback is not reachable from a sibling container. | `docker compose logs api \| head -1` — it will say `listening on http://127.0.0.1:8000`, not `0.0.0.0:8000` | Remove the `ADDR` line. The image sets `ENV ADDR=0.0.0.0:8000`; do not add one to `.env`. |
+| **The database will not open, or `backup` fails with `disk I/O error` / `unable to open database file`.** | SQLite runs in WAL mode, which needs a filesystem with working POSIX locking. Some VPS overlay and network filesystems do not have it. The service can start and then fail on first write. | `sqlite3 data/gamematch.db 'PRAGMA journal_mode;'` — `wal` means locking works. | Put `./data` on local disk (ext4, xfs, btrfs), not on NFS, CIFS, or a fuse mount. Relocating it is a stop, `mv`, restart. |
+| **Nobody can sign in, and the response is `{"ok":true}` with no `devCode`.** | `otp/start` enforces its rate limits **silently**: over the limit it stores nothing and says nothing else, on purpose, so the endpoint cannot be used to probe which numbers exist. Limits are 5 per IP and 3 per phone per 15 minutes and they are **persisted**, so restarting `api` does not clear them. | `sqlite3 data/gamematch.db "SELECT bucket, count FROM rate_limits WHERE bucket LIKE 'otp:start%';"` — with `APP_DEBUG=true`, a code that *was* issued comes back as `devCode`, so its absence is the signal. | Wait the window out, or clear the rows. Do not conclude the configuration is wrong. |
+| **`sms send: twilio: status 401: Authentication Error - invalid username`.** | Wrong `TWILIO_ACCOUNT_SID`/`TWILIO_AUTH_TOKEN`. The request still returns `{"ok":true}`. | `docker compose logs api \| grep "sms send"` | Fix the credentials and `docker compose up -d --force-recreate api`. |
+| **No `photos-*.tar.gz` across several consecutive backups.** | `data/photos` is gone. The script skips the archive without warning, exits 0, and the backup container stays `healthy` because its healthcheck only looks at `.db` files. | `ls -ld data/photos`; compare consecutive `ls backups/` listings | Restore the directory. Until then every backup is database-only — see [Backups](#backups). |
+| **The `backup` container restarts over and over; `docker compose logs backup` is nearly empty.** | Its `command:` runs `apk add --no-cache bash sqlite` on every start. If the host cannot reach the alpine mirrors, PID 1 exits non-zero and `restart: unless-stopped` retries with backoff for as long as the stack is up. | `docker compose logs backup` | Open outbound network access to the alpine package mirrors. |
+| **`docker compose exec web caddy reload` → `dial tcp [::1]:2019: connect: connection refused`.** | `deploy/Caddyfile:21` is `admin off`, so the admin API on :2019 is not listening. `reload` is implemented on top of it. | `docker compose exec web caddy adapt --config /etc/caddy/Caddyfile --pretty` shows `"admin": {"disabled": true}` | To check a config: `caddy adapt` (offline, touches nothing). To apply one: `docker compose restart web`. A restart drops in-flight TLS connections — `stop_grace_period: 30s` lets Caddy drain first, but a client mid-request at that instant is cut. |
+| **Manual backup fails with `env: can't execute 'bash': No such file or directory` (rc 127).** | You overrode the entry point, which removed the service's `command:` and with it `apk add bash sqlite`. The script's shebang is `#!/usr/bin/env bash` and stock alpine has no bash. | The `rc=127` above. | `docker compose exec backup /scripts/backup.sh /backups`. |
+
+Two general rules that cover most of the above:
+
+- **Read `docker compose logs api`, not `docker compose ps`.** `ps` samples a
+  crash loop at an arbitrary point in its cycle and every sample looks plausible.
+  The log cannot be misread, and it names the variable.
+- **Probe more than one URL.** "The site loads" is not evidence the API booted: a
+  crash-looping API still serves the PWA at `/` and 502s `/v1`. A missing
+  certificate is the reverse — `/` fails too.
+
+---
+
+## Appendix A — verification evidence
+
+### A1 — Verified on local Docker
 
 Recorded on a local machine on 2026-10-14, against the stack as committed at
 this point in the plan (Tasks 1–4). Every command below was run against the live
@@ -25,7 +614,7 @@ Two things about how to read it:
   URL. Everything below reaches it through Caddy on `https://localhost`, or from
   inside the compose network.
 
-### Prerequisites
+#### Prerequisites
 
 ```bash
 pnpm install
@@ -75,7 +664,7 @@ mkdir -p data backups
 docker run --rm -v "$PWD/data:/data" alpine:3.24 chown -R 10001:10001 /data
 ```
 
-### Step 1 — start the stack and seed
+#### Step 1 — start the stack and seed
 
 ```bash
 docker compose up -d --build
@@ -132,7 +721,7 @@ gamematch-web-1      gamematch-web:latest   "caddy run --config …"   web      
 `api seed` is idempotent: it re-seeds over an existing database without
 complaint.
 
-### Step 2 — the API port is NOT published
+#### Step 2 — the API port is NOT published
 
 This is the assertion the whole design exists to protect. If it ever returns
 `200`, the API is on the host's public interface with no TLS.
@@ -183,7 +772,7 @@ $ for ip in 10.194.1.28 100.85.246.117 172.17.0.1 172.18.0.1 172.19.0.1 172.20.0
 bridges 172.18, 172.19, 172.20. `incusbr0` was not in the loop. Six addresses,
 each refused.)
 
-### Step 3 — the shipped relative-root default is not in use
+#### Step 3 — the shipped relative-root default is not in use
 
 The defect this catches: with `GAMEMATCH_ROOT` unset and cwd `/`, every asset
 404s while `/v1/healthz` still answers 200, so a check that probes only the API
@@ -211,7 +800,7 @@ would make the check independent of what is on the host:
 docker compose exec web sh -c 'ls /srv/dist/assets' | grep -m1 '\.js$'
 ```
 
-### Step 4 — the proxy reaches the API
+#### Step 4 — the proxy reaches the API
 
 ```bash
 curl -sk -o /dev/null -w '%{http_code}\n' https://localhost/v1/healthz
@@ -225,7 +814,7 @@ $ curl -sk -o /dev/null -w '%{http_code}\n' https://localhost/v1/healthz
 `000` here instead would mean Caddy cannot reach `api` — the failure mode if
 `ADDR` were left at `127.0.0.1:8000`.
 
-### Step 5 — the SPA is served with the right caching
+#### Step 5 — the SPA is served with the right caching
 
 ```bash
 curl -sk -o /dev/null -w '%{http_code}\n' https://localhost/boot
@@ -245,7 +834,7 @@ $ curl -sk -o /dev/null -w '%{http_code}\n' https://localhost/deep/spa/route
 `/boot` is the PWA's own `start_url` and is the path the original exact-match
 `@shell` allowlist missed.
 
-### Step 6 — security headers
+#### Step 6 — security headers
 
 ```bash
 for h in Content-Security-Policy Strict-Transport-Security X-Frame-Options Permissions-Policy X-Content-Type-Options; do
@@ -263,14 +852,14 @@ X-Content-Type-Options           1
 
 One occurrence each.
 
-### Step 7 — data survives a restart
+#### Step 7 — data survives a restart
 
 The plan's step 7 does not run as written, and **the worst version of it passes
 silently**. One query names a column the schema does not have and dies; the
 last one is a tautology that exits 0 while asserting nothing. Both are corrected
 below, with the literal behaviour of each shown first.
 
-#### (a) `otp_codes` is keyed on `phone`, not `phone_e164` — this one errors
+##### (a) `otp_codes` is keyed on `phone`, not `phone_e164` — this one errors
 
 ```bash
 CODE="$(sqlite3 data/gamematch.db "SELECT code FROM otp_codes WHERE phone_e164 = '+15551239999';")"
@@ -298,7 +887,7 @@ code, so an unreadable OTP is only detected after it has been consumed — and
 `store.TakeOTP` (`apps/server/internal/store/auth.go:73`) deletes the row as it
 reads it, so the row is gone either way.
 
-#### (b) The last query is a tautology — this one silently passes
+##### (b) The last query is a tautology — this one silently passes
 
 ```sql
 SELECT name FROM users WHERE phone_e164_hash =
@@ -352,7 +941,7 @@ row with no `Name`, and `store/users.go:71-79` defaults it to
 `status=pending, onboarding_step=intent`. Use `quote(u.name)` so NULL is visible
 rather than looking like missing output.
 
-#### (c) The corrected step — asserts, and proves *that* user
+##### (c) The corrected step — asserts, and proves *that* user
 
 This is the script the plan now carries, verbatim:
 
@@ -447,7 +1036,7 @@ $ echo $?
 — the step reporting a lost user when the only thing that happened is that the
 user already existed.
 
-#### (c2) `otp/start` fails silently once the rate limit is hit
+##### (c2) `otp/start` fails silently once the rate limit is hit
 
 If `$CODE` comes back empty, the message to believe is **not** `is
 APP_ENV=local?`. `otp/start` enforces its limits silently
@@ -482,7 +1071,7 @@ a number that has not just been used, or wait the window out. On the VPS this is
 not a nuisance: it is the same limit that protects Twilio from being burned, and
 it is per IP.
 
-#### (d) The corrected query has to be able to say "no"
+##### (d) The corrected query has to be able to say "no"
 
 A check that always returns a row proves nothing either. Same query, same
 `JOIN`, for a phone that never signed in:
@@ -531,7 +1120,7 @@ $ cat jar
 absent on the VPS; `docs/superpowers/plans/2026-10-13-docker-deployment.md`
 Task 6 is what proves that.
 
-### Step 8 — the data directory is host-owned, not root-owned
+#### Step 8 — the data directory is host-owned, not root-owned
 
 ```bash
 ls -ld data data/photos
@@ -591,7 +1180,7 @@ So the ownership property the step protects holds. Note the mode: `0750`, so the
 host user cannot `find data/photos` without sudo — that is `media.dirPerm`
 (`apps/server/internal/media/photos.go:93`) by design, not a permissions bug.
 
-#### The real exposure: a missing photos directory is skipped in silence
+##### The real exposure: a missing photos directory is skipped in silence
 
 The fresh-install case is a false alarm in the verification step. This is not:
 
@@ -656,7 +1245,7 @@ gives `env: can't execute 'bash': No such file or directory`, because the script
 shebang is `#!/usr/bin/env bash` and the base image has no bash. Any one-off
 backup has to repeat the `apk add`.
 
-### Step 9 — logs and rotation
+#### Step 9 — logs and rotation
 
 ```bash
 docker compose logs --tail 20 web
@@ -760,7 +1349,7 @@ moment is cut rather than finished.
 
 ---
 
-## Verified: production boot path
+### A2 — Verified: production boot path
 
 Recorded on a local machine on 2026-10-14, immediately after the section above,
 against the same stack. Every local run so far has used `APP_ENV=local`, and
@@ -777,7 +1366,7 @@ is in `.env` or in this document.
 The plan's step 1 **does not pass as written**; the first block is the failure and
 the diagnosis, because an operator following the plan hits exactly this.
 
-### Step 1 — boot in production mode with placeholder credentials
+#### Step 1 — boot in production mode with placeholder credentials
 
 ```bash
 cp .env .env.local.bak
@@ -859,7 +1448,7 @@ variable is absent from the container's environment entirely, because the
 what `Validate()` requires — not "set to empty", which `getenv` would also treat
 as unset but which leaves a confusing line in the file.
 
-### Step 2 — the API port is still closed in production mode
+#### Step 2 — the API port is still closed in production mode
 
 ```bash
 curl -s -o /dev/null -w '%{http_code}\n' --max-time 3 http://127.0.0.1:8000/v1/healthz
@@ -882,7 +1471,7 @@ $ docker compose exec web wget -qO- http://api:8000/v1/healthz
 compose file, not of the environment, and `APP_ENV=production` does not change
 it. The in-network `wget` is there so `000` is not mistaken for a dead API.
 
-### Step 3 — `APP_DEBUG` is genuinely off
+#### Step 3 — `APP_DEBUG` is genuinely off
 
 ```bash
 curl -sk -X POST https://localhost/v1/auth/otp/start -d '{"phone":"+15551230000"}'
@@ -950,7 +1539,7 @@ flag is the incident kill switch (`auth.go:156`); it is defaulted by migration
 `auth.public_signup` (`seed.go:143`). Expect this line on a VPS with a wrong
 `TWILIO_ACCOUNT_SID`.
 
-### Step 4 — a missing variable still fails the boot
+#### Step 4 — a missing variable still fails the boot
 
 This is the Review Focus item: *if the entrypoint swallowed the exit code, a VPS
 would deploy a silently non-functional service.*
@@ -1039,7 +1628,7 @@ nothing. (The raw log line is a single line whose `request` object holds the ful
 headers and TLS detail; it is abbreviated to `...` here for width. No value in the
 line has been altered.)
 
-### Step 5 — restore local config
+#### Step 5 — restore local config
 
 ```bash
 mv .env.local.bak .env
@@ -1068,7 +1657,7 @@ control for step 3: **the same request returns `devCode` under
 `APP_ENV=local`/`APP_DEBUG=true` and omits it under production**, on the same
 stack, minutes apart.
 
-### Summary for the runbook
+#### Summary for the runbook
 
 Two things an operator needs to know that the plan does not say:
 
@@ -1079,8 +1668,496 @@ Two things an operator needs to know that the plan does not say:
    rather than the documented "edit the local block into the VPS block"
    instruction. Delete the line, do not just change `APP_ENV`.
 2. **A production misconfiguration shows as a crash loop, not as `Exited`.**
-   Because of `restart: unless-stopped`, check the exit code with `docker
-   inspect`, not `docker compose ps`. The symptom an operator will actually see
-   on the site is a PWA that loads and an API that 502s.
+   Because of `restart: unless-stopped`, `docker compose ps` samples the loop at
+   an arbitrary point and usually reads `Up 1 second (health: starting)`. Read
+   the log, and confirm with `docker inspect --format '{{.RestartCount}}'`.
+   *Not* `.State.ExitCode`, which resets to `0` on every restart and reads `0`
+   on a healthy boot too. The symptom an operator will actually see on the site
+   is a PWA that loads and an API that 502s.
 
-Both belong in the VPS section as written.
+Both are now written up in [Deploying to a VPS](#deploying-to-a-vps) and in
+[Troubleshooting](#troubleshooting).
+---
+
+## Appendix B — verification evidence (continued)
+
+Everything below was recorded on 2026-10-14 against the same stack, after the
+work in [Appendix A](#appendix-a--verification-evidence). Same standard: real
+terminal output, no altered values, trims declared inline.
+
+### B1 — the `.env` VPS-block transformation, end to end
+
+The procedure in [step 3](#3-fill-in-the-production-variables) is two `sed`
+commands. They are worth executing rather than publishing untested, because the
+exact failure they exist to prevent — a crash loop on `DEV_OTP` — was hit
+during this plan's Task 6.
+
+Run against a copy of `.env.example`, placeholder credentials appended:
+
+```
+$ cp .env.example /tmp/gm.env
+$ sed -i 's|^\([A-Z][A-Z_0-9]*=\)|#\1|' /tmp/gm.env
+$ sed -i '/^# --- VPS:/,/^# --- optional:/{/^#DEV_OTP=/!{/^#[A-Z][A-Z_0-9]*=/s/^#//}}' /tmp/gm.env
+$ sed -i 's|^GAMEMATCH_SITE=.*|GAMEMATCH_SITE=localhost|' /tmp/gm.env
+$ printf 'TWILIO_ACCOUNT_SID=ACplaceholder\nTWILIO_AUTH_TOKEN=placeholder\nTWILIO_FROM=+15550000000\nTURNSTILE_SECRET=0xplaceholder\n' >> /tmp/gm.env
+
+$ grep -E '^[A-Z]|^#DEV_OTP|^#VAPID' /tmp/gm.env
+APP_ENV=production
+GAMEMATCH_SITE=localhost
+HTTP_PORT=80
+HTTPS_PORT=443
+APP_DEBUG=false
+#DEV_OTP=
+SMS_PROVIDER=twilio
+TWILIO_ACCOUNT_SID=
+TWILIO_AUTH_TOKEN=
+TWILIO_FROM=
+TURNSTILE_SECRET=
+HOUSE_USER_ID=00000000-0000-4000-8000-000000000001
+#VAPID_PUBLIC_KEY=
+#VAPID_PRIVATE_KEY=
+#VAPID_SUBJECT=mailto:ops@example.com
+TWILIO_ACCOUNT_SID=ACplaceholder
+TWILIO_AUTH_TOKEN=placeholder
+TWILIO_FROM=+15550000000
+TURNSTILE_SECRET=0xplaceholder
+```
+
+Four things to read off that:
+
+- **The local block is gone** — every one of its lines starts with `#`. It does
+  not appear in this listing at all.
+- **`#DEV_OTP=` stays commented**, exactly as `.env.example` line 8 requires.
+- **The optional web-push block stays commented.** It sits after the
+  `# --- optional:` marker, outside the range the second `sed` touches.
+- **Appending is safe.** The three `TWILIO_*` keys appear twice — once empty from
+  the uncommented block, once with a value from the `printf` — and the container
+  receives the **later** one. That is the "fill the values in" shortcut, verified
+  rather than assumed:
+
+  ```
+  $ docker compose exec api env | grep -E "^(APP_ENV|APP_DEBUG|DEV_OTP|SMS_PROVIDER|TWILIO_[A-Z_]+|TURNSTILE_SECRET|GAMEMATCH_SITE)=" | sort
+  APP_DEBUG=false
+  APP_ENV=production
+  GAMEMATCH_SITE=localhost
+  SMS_PROVIDER=twilio
+  TURNSTILE_SECRET=0xplaceholder
+  TWILIO_ACCOUNT_SID=ACplaceholder
+  TWILIO_AUTH_TOKEN=placeholder
+  TWILIO_FROM=+15550000000
+  ```
+
+`DEV_OTP` is in that grep's pattern and does not appear: it is absent from the
+container's environment entirely, which is what `Validate()` requires. "Set to
+empty" would also be read as unset, but it leaves a confusing line in the file.
+
+The whole documented path boots, with no crash loop:
+
+```
+$ docker compose up -d --force-recreate api web
+ Container gamematch-api-1 Recreate
+ Container gamematch-api-1 Recreated
+ Container gamematch-web-1 Recreate
+ Container gamematch-web-1 Recreated
+ Container gamematch-api-1 Starting
+ Container gamematch-api-1 Started
+ Container gamematch-api-1 Waiting
+ Container gamematch-api-1 Healthy
+ Container gamematch-web-1 Starting
+ Container gamematch-web-1 Started
+
+$ docker compose ps
+NAME                 IMAGE                  COMMAND                  SERVICE   CREATED          STATUS                    PORTS
+gamematch-api-1      gamematch-api:latest   "/usr/local/bin/game…"   api       24 seconds ago   Up 14 seconds (healthy)   8000/tcp
+gamematch-backup-1   alpine:3.24            "sh -c 'apk add --no…"   backup    6 minutes ago    Up 6 minutes (healthy)
+gamematch-web-1      gamematch-web:latest   "caddy run --config …"   web       19 seconds ago   Up 10 seconds             0.0.0.0:80->80/tcp, [::]:80->80/tcp, 0.0.0.0:443->443/tcp, [::]:443->443/tcp, 443/udp, 2019/tcp
+
+$ docker inspect --format '{{.RestartCount}}' gamematch-api-1
+0
+
+$ docker compose logs api | tail -3
+api-1  | 2026/10/14 22:34:28 gamematch listening on http://0.0.0.0:8000 (data dir /data, debug=false)
+api-1  | 2026/10/14 22:34:30 GET /v1/healthz 200 0s
+```
+
+`GAMEMATCH_SITE` is `localhost` here, not a real domain: the transformation is
+what is under test, and a real domain would send this container to the public
+ACME service. On the VPS it is your domain — see [B2](#b2--what-a-failed-certificate-looks-like)
+for what happens when it is not resolvable.
+
+**The `sed` delimiter.** GNU sed does not do what `\#` looks like it does. With
+`/` as the delimiter, `\#` does not mean "a literal `#` in the replacement":
+
+```
+$ printf 'A=1\nB=2\n' | sed 's/^\([A-Z][A-Z_0-9]*=\)/\/#\1/'
+/#A=1
+/#B=2
+$ printf 'A=1\nB=2\n' | sed 's|^\([A-Z][A-Z_0-9]*=\)|#\1|'
+#A=1
+#B=2
+```
+
+The first form leaves `/#APP_ENV=local` on every line of the local block, which
+Compose does not read as a comment. The `|` delimiter does not have the problem.
+
+### B2 — what a failed certificate looks like
+
+The plan requires DNS to point at the host before the first start. The *symptom*
+of getting that wrong is worth knowing, because it is not an obvious one.
+
+Produced deliberately by pointing `GAMEMATCH_SITE` at a name that cannot be
+issued for. **`.invalid` is reserved by RFC 2606 and is never registered**, so
+no real certificate was issued and no real domain was touched — but Caddy does
+still register an anonymous ACME account with Let's Encrypt as part of trying,
+which is the cost of this test:
+
+```
+$ sed -i 's|^GAMEMATCH_SITE=.*|GAMEMATCH_SITE=gamematch-does-not-exist.invalid|' .env
+$ docker compose up -d --force-recreate web
+...
+web-1  | {"level":"info","ts":1792017148.891791,"logger":"tls.obtain","msg":"acquiring lock","identifier":"gamematch-does-not-exist.invalid"}
+web-1  | {"level":"info","ts":1792017148.9162717,"logger":"tls.obtain","msg":"lock acquired","identifier":"gamematch-does-not-exist.invalid"}
+web-1  | {"level":"info","ts":1792017148.9164073,"logger":"tls.obtain","msg":"obtaining certificate","identifier":"gamematch-does-not-exist.invalid"}
+web-1  | {"level":"info","ts":1792017149.3780818,"logger":"http","msg":"using ACME account","account_id":"https://acme-v02.api.letsencrypt.org/acme/acct/3864904546","account_contact":[]}
+web-1  | {"level":"error","ts":1792017149.4332113,"logger":"tls.obtain","msg":"could not get certificate from issuer","identifier":"gamematch-does-not-exist.invalid","issuer":"acme-v02.api.letsencrypt.org-directory","error":"HTTP 400 urn:ietf:params:acme:error:rejectedIdentifier - Invalid identifiers requested :: Cannot issue for \"gamematch-does-not-exist.invalid\": Domain name does not end with a valid public suffix (TLD)"}
+web-1  | {"level":"error","ts":1792017149.4332533,"logger":"tls.obtain","msg":"will retry","error":"[gamematch-does-not-exist.invalid] Obtain: [...] creating new order: attempt 1: https://acme-v02.api.letsencrypt.org/acme/new-order: HTTP 400 ... (ca=https://acme-v02.api.letsencrypt.org/directory)","attempt":1,"retrying_in":60,"elapsed":0.516964286,"max_duration":2592000}
+```
+
+The `will retry` line with `retrying_in` and `max_duration: 2592000` (30 days) is
+the shape to recognise. Caddy keeps trying, so **the container stays `Up` the
+whole time** and `docker compose ps` looks healthy. A domain that resolves but
+has no A record pointing here fails at the HTTP-01 challenge instead, with a
+different message; the log signature to look for either way is
+`docker compose logs web | grep tls.obtain`.
+
+What the client sees is the important part, and it is not a partial outage:
+
+```
+$ curl -sk -o /dev/null -w 'static /      -> %{http_code}\n' --max-time 5 https://localhost/
+static /      -> 000
+$ curl -sk -o /dev/null -w 'proxied /v1  -> %{http_code}\n' --max-time 5 https://localhost/v1/healthz
+proxied /v1  -> 000
+$ curl -sS --max-time 5 https://localhost/
+curl: (35) TLS connect error: error:0A000438:SSL routines::tlsv1 alert internal error
+```
+
+Plain HTTP still redirects, to an HTTPS that cannot complete — so "the redirect
+works" proves nothing:
+
+```
+$ curl -s -o /dev/null -D - --max-time 5 http://localhost/
+HTTP/1.1 308 Permanent Redirect
+Connection: close
+Location: https://localhost/
+```
+
+Contrast with the API crash loop in Appendix A.2 step 4, where `/` is `200` and
+only `/v1` is `502`. **A missing certificate takes down the whole origin, static
+assets included.** Probing two URLs tells the two apart.
+
+Reverting `GAMEMATCH_SITE` to a name Caddy can serve and restarting `web`
+recovers with no other change — the ACME account and certificate live in the
+`caddy-data` volume, so a restart is enough.
+
+### B3 — the restore drill
+
+Run end to end against a live stack. This is the step that decides whether the
+backup is worth having, so the failures are recorded as well as the result.
+
+#### Setup — rows worth losing
+
+```
+$ docker compose run --rm api seed
+2026/10/14 22:28:40 seeded /data/gamematch.db
+
+$ curl -sk -X POST https://localhost/v1/auth/otp/start -d '{"phone":"+15551239999"}'
+{"devCode":"123456","ok":true}
+
+$ CODE="$(sqlite3 data/gamematch.db "SELECT code FROM otp_codes WHERE phone = '+15551239999';")"
+$ curl -sk -X POST https://localhost/v1/auth/otp/verify \
+    -d "{\"phone\":\"+15551239999\",\"code\":\"$CODE\"}" -o /dev/null -w '%{http_code}\n'
+200
+
+$ curl -sk -b jar -X POST https://localhost/v1/me/photos \
+    -F "photo=@apps/web/dist/icons/icon-192.png;type=image/png"
+{"photo":{"id":"ade26679-efd6-4785-8b49-72af32a4f7ad","url":"/v1/photos/ade26679-efd6-4785-8b49-72af32a4f7ad","state":"ok"}}
+
+$ ls -ldn data data/photos
+drwxr-xr-x 1 10001 10001 100 Oct 14 15:28 data
+drwxr-x--- 1 10001 10001  72 Oct 14 15:28 data/photos
+
+$ sqlite3 data/gamematch.db 'SELECT count(*) FROM users;'
+5
+```
+
+`devCode` is present because `APP_ENV=local` / `APP_DEBUG=true`. A production
+host returns `{"ok":true}` with no `devCode`, and the OTP cannot be read off the
+database — so a restore drill has to run against a local-mode stack. Nothing
+else about the stack differs.
+
+#### The scheduled backup lands
+
+The `backup` service runs once about 35 seconds after start (`apk add`, then
+`sleep 30`, then the script). No manual invocation:
+
+```
+$ docker compose ps backup
+NAME                 IMAGE         COMMAND                  SERVICE   CREATED         STATUS                             PORTS
+gamematch-backup-1   alpine:3.24   "sh -c 'apk add --no…"   backup    About a minute   Up About a minute (healthy)   
+
+$ docker compose logs --tail 5 backup
+backup-1  | backup: wrote /backups/gamematch-20261014T222905Z.db
+
+$ ls -la backups/
+total 516
+drwxr-xr-x 1 duke duke      118 Oct 14 15:29 .
+drwxr-xr-x 1 duke duke      438 Oct 14 15:27 ..
+-rw-r--r-- 1 root root 516096 Oct 14 22:29 gamematch-20261014T222905Z.db
+-rw-r--r-- 1 root root   8984 Oct 14 22:29 photos-20261014T222905Z.tar.gz
+```
+
+Both artefacts, from the loop, unprompted. `photos-*.tar.gz` is present only
+because the upload above created `data/photos` — see Appendix A.1 step 8 for what
+its absence means.
+
+The on-demand path from [Backups](#backups), also verified:
+
+```
+$ docker compose exec backup /scripts/backup.sh /backups
+backup: wrote /backups/gamematch-20261014T222944Z.db
+rc=0
+```
+
+And the form that does not work, for the record:
+
+```
+$ docker compose run --rm --entrypoint /scripts/backup.sh backup /backups
+ Container gamematch-api-1 Running
+ Container gamematch-backup-run-2370f68e0a50 Creating
+ Container gamematch-backup-run-2370f68e0a50 Created
+env: can't execute 'bash': No such file or directory
+
+rc=127
+```
+
+Overriding the entry point replaces the service's `command:`, which is where
+`apk add --no-cache bash sqlite` lives. Stock alpine has no bash and the script's
+shebang is `#!/usr/bin/env bash`.
+
+#### Write one more row, so the restore has something to lose
+
+```
+$ curl -sk -X POST https://localhost/v1/auth/otp/start -d '{"phone":"+15552228888"}'
+{"devCode":"123456","ok":true}
+$ curl -sk -X POST https://localhost/v1/auth/otp/verify \
+    -d "{\"phone\":\"+15552228888\",\"code\":\"$CODE\"}" -o /dev/null -w '%{http_code}\n'
+verify=200
+$ sqlite3 data/gamematch.db "SELECT u.id, p.phone_e164, u.created_at FROM users u JOIN user_private p ON p.user_id=u.id WHERE p.phone_e164='+15552228888';"
+f9521e58-501b-4444-b95d-64d9001dd466|+15552228888|2026-10-14T22:29:38.319487Z
+
+$ for f in backups/gamematch-*.db; do printf '%s %s\n' "$f" "$(sqlite3 "$f" 'SELECT count(*) FROM users;')"; done
+backups/gamematch-20261014T222905Z.db 5
+backups/gamematch-20261014T222944Z.db 6
+```
+
+Two snapshots, 5 and 6 users. **The drill restores the 5-user one.** Restoring
+the newest would return a count equal to the live one and prove nothing — the
+whole test is that data written *after* the snapshot is gone.
+
+#### The plan's commands fail for a non-root deploy user
+
+The plan's step 4 is `mv`, `rm` and `cp` inside `./data`. On a VPS where the
+deploy user owns the checkout, `./data` is `drwxr-xr-x` owned by `10001`, so
+only UID 10001 can create or rename an entry in it, and those three commands are
+refused:
+
+```
+$ docker compose stop api
+ Container gamematch-api-1 Stopping
+ Container gamematch-api-1 Stopped
+
+$ sqlite3 "$STAMP" 'SELECT count(*) FROM users;' > /tmp/before.txt
+$ sqlite3 data/gamematch.db 'SELECT count(*) FROM users;' > /tmp/live.txt
+Parse error in 2nd command line argument: attempt to write a readonly database (8)
+
+$ mv data/gamematch.db data/gamematch.db.pre-restore
+mv: cannot move 'data/gamematch.db' to 'data/gamematch.db.pre-restore': Permission denied
+
+$ rm -f data/gamematch.db-wal data/gamematch.db-shm
+$ cp "$STAMP" data/gamematch.db
+cp: cannot create regular file 'data/gamematch.db': Permission denied
+```
+
+The `sqlite3` failure is the more interesting one and it is **not** about
+permissions on the file. `sqlite3` opens read-write by default, and a WAL
+database needs its `-shm` sidecar; with the API stopped there is no `-shm`, so
+SQLite tries to create one in a directory the host user does not own. The
+sidecars are gone precisely *because* the API was stopped cleanly:
+
+```
+$ ls data
+gamematch.db
+gamematch.db.pre-restore
+photos
+photos.pre-restore
+
+$ docker compose start api >/dev/null; sleep 4
+$ ls -ln data
+-rw-r--r-- 1 10001 10001 516096 Oct 14 15:30 gamematch.db
+-rw-r--r-- 1 10001 10001 32768 Oct 14 15:31 gamematch.db-shm
+-rw-r--r-- 1 10001 10001     0 Oct 14 15:31 gamematch.db-wal
+
+$ sqlite3 data/gamematch.db 'SELECT count(*) FROM users;'
+5
+rc=0
+```
+
+The API recreates both sidecars on open and the same host-side query works. So:
+**verify either as root, or after the API is back up.** The same mechanism is why
+the `backup` service's `./data` mount cannot be `:ro` (`docker-compose.yml`).
+
+#### The restore, as root
+
+Same three operations, done with the privileges they need. On a VPS, `sudo`
+instead of the container:
+
+```
+$ docker run --rm -v "$PWD/data:/d" -v "$PWD/backups:/b:ro" alpine:3.24 sh -c "
+    echo -n 'live users before restore: '; sqlite3 /d/gamematch.db 'SELECT count(*) FROM users;'
+    mv /d/gamematch.db /d/gamematch.db.pre-restore
+    rm -f /d/gamematch.db-wal /d/gamematch.db-shm
+    cp /b/gamematch-20261014T222905Z.db /d/gamematch.db
+    tar xzf /b/photos-20261014T222905Z.tar.gz -C /d
+    chown -R 10001:10001 /d
+    ls -ln /d
+  "
+live users before restore: 6
+-rw-r--r-- 1 10001 10001 516096 Oct 14 22:30 gamematch.db
+-rw-r--r-- 1 10001 10001 516096 Oct 14 22:29 gamematch.db.pre-restore
+drwxr-x--- 1 10001 10001     72 Oct 14 22:30 photos
+```
+
+**6 live, 5 in the snapshot.** That difference is the loss the drill is built
+around. The photo archive:
+
+```
+$ tar tzf backups/photos-20261014T222905Z.tar.gz
+photos/
+photos/2e0df506-ff09-400d-a7ad-0d356d86f1a0/
+photos/2e0df506-ff09-400d-a7ad-0d356d86f1a0/ade26679-efd6-4785-8b49-72af32a4f7ad.jpg
+photos/2e0df506-ff09-400d-a7ad-0d356d86f1a0/ade26679-efd6-4785-8b49-72af32a4f7ad_t.jpg
+```
+
+restored with UID 10001 and mode 0640:
+
+```
+$ docker run --rm -v "$PWD/data:/d:ro" alpine:3.24 ls -l /d/photos/2e0df506-ff09-400d-a7ad-0d356d86f1a0
+total 12
+-rw-r----- 1 10001 10001 4056 Oct 14 22:28 ade26679-efd6-4785-8b49-72af32a4f7ad.jpg
+-rw-r----- 1 10001 10001 6008 Oct 14 22:28 ade26679-efd6-4785-8b49-72af32a4f7ad_t.jpg
+```
+
+That listing is itself worth knowing about: `data/photos` is mode `0750`, so the
+host user cannot `find` into it without `sudo`, and a restore check that tries
+will look like a failure. `media.dirPerm`
+(`apps/server/internal/media/photos.go:93`) is deliberate.
+
+#### The verification
+
+```
+$ docker compose start api
+ Container gamematch-api-1 Starting
+ Container gamematch-api-1 Started
+
+$ docker compose ps api
+NAME              IMAGE                  COMMAND                  SERVICE   CREATED         STATUS                   PORTS
+gamematch-api-1   gamematch-api:latest   "/usr/local/bin/game…"   api       2 minutes ago   Up 4 seconds (healthy)   8000/tcp
+
+$ curl -sk -o /dev/null -w '%{http_code}\n' https://localhost/v1/healthz
+200
+
+$ sqlite3 data/gamematch.db 'SELECT count(*) FROM users;' > /tmp/opencode/after.txt
+$ cat /tmp/opencode/after.txt
+5
+$ diff /tmp/opencode/before.txt /tmp/opencode/after.txt && echo "restore verified"
+restore verified
+```
+
+**`restore verified`.** `before` and `after` are both `5`, matching the 5 users
+in the snapshot, against 6 in the live database before the restore.
+
+The counts alone prove the file was copied. These prove it was the *right*
+file, and that the restore actually rolled something back:
+
+```
+$ sqlite3 data/gamematch.db 'PRAGMA integrity_check;'
+ok
+$ sqlite3 data/gamematch.db 'SELECT count(*) FROM sqlite_master;'
+106
+$ sqlite3 data/gamematch.db "SELECT count(*) FROM users u JOIN user_private p ON p.user_id=u.id WHERE p.phone_e164 IN ('+15552228888','+15553334444');"
+0
+$ sqlite3 data/gamematch.db 'SELECT id, path FROM photos;'
+ade26679-efd6-4785-8b49-72af32a4f7ad|2e0df506-ff09-400d-a7ad-0d356d86f1a0/ade26679-efd6-4785-8b49-72af32a4f7ad.jpg
+$ sqlite3 data/gamematch.db 'PRAGMA journal_mode;'
+wal
+$ sqlite3 data/gamematch.db 'PRAGMA user_version;'
+9
+$ docker inspect --format 'RestartCount={{.RestartCount}} Status={{.State.Status}}' gamematch-api-1
+RestartCount=0 Status=running
+$ docker compose logs api | tail -4
+api-1  | 2026/10/14 22:31:05 GET /v1/healthz 200 0s
+api-1  | 2026/10/14 22:31:18 shutdown: draining
+api-1  | 2026/10/14 22:31:23 gamematch listening on http://0.0.0.0:8000 (data dir /data, debug=true)
+api-1  | 2026/10/14 22:31:25 GET /v1/healthz 200 0s
+```
+
+Both users created after the snapshot — `+15552228888` (`f9521e58-…`) and a
+second one, `+15553334444` (`6c7aaae9-…`) — are **absent** from the restored
+database. The photo row and both its files came back. The restored database is
+in WAL mode and at `user_version 9`, the same schema level the live one was.
+
+The `rate_limits` table rolled back too, which is a nice cross-check that the
+restore is real and not a coincidence of counts:
+
+```
+$ sqlite3 data/gamematch.db "SELECT bucket, count FROM rate_limits WHERE bucket LIKE 'otp:start%';"
+otp:start:ip:4be83b3115428950|1
+otp:start:phone:834fa3a38e93d341|1
+```
+
+A count of `1` for the per-IP bucket, when five sign-ins had been made during
+the drill. The snapshot was taken after the first one. **A restore that had
+silently not happened would show `4`.**
+
+#### One artefact worth knowing about
+
+Reading a snapshot with a plain `sqlite3 <file>` leaves `-shm` and `-wal` beside
+it — even with `mode=ro`, because a WAL database's index lives in the shared
+memory file:
+
+```
+$ ls -ln backups/
+-rw-r--r-- 1    0    0 516096 Oct 14 22:29 gamematch-20261014T222905Z.db
+-rw-r--r-- 1 1000 1000 32768 Oct 14 22:30 gamematch-20261014T222905Z.db-shm
+-rw-r--r-- 1    0    0     0 Oct 14 22:29 gamematch-20261014T222905Z.db-wal
+```
+
+Harmless — both are 0 bytes or an empty index, so nothing is pending in them —
+but the prune in `scripts/backup.sh` matches `gamematch-*.db` and
+`photos-*.tar.gz`, so **these sidecars are never deleted** and accumulate in
+`./backups` at 32 KiB per snapshot for the life of the deployment:
+
+```
+$ find backups/ -name 'gamematch-*.db' | sort
+backups/gamematch-20261014T222905Z.db
+backups/gamematch-20261014T222944Z.db
+$ find backups/ -name 'photos-*.tar.gz' | sort
+backups/photos-20261014T222905Z.tar.gz
+backups/photos-20261014T222944Z.tar.gz
+```
+
+Two snapshots, four prune matches — the four `-shm`/`-wal` files in the listing
+above match neither pattern.
+
+They also cannot corrupt a restore: the procedure copies the `.db` and not the
+sidecars, which is the correct behaviour. Do not start copying `*.db*`.
