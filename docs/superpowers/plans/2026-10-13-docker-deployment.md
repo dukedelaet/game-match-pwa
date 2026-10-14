@@ -143,7 +143,7 @@ Expected: FAIL. Specifically `/boot is not cached` (the `@shell` matcher is an e
 Three changes, all from the spec:
 
 - **Absolute root.** `root * {$GAMEMATCH_ROOT:/srv/dist}`. The default resolves inside the image where it always exists, with no environment-dependent working directory — which is what makes the container design safe. `$GAMEMATCH_LOG_DIR` replaces the hardcoded `/var/log/caddy`.
-- **Cache rule moved out of the matcher.** `no-cache` goes on the whole handler with `@assets` overriding it, because `try_files {path} /index.html` serves the shell for *every* unmatched path while the old `@shell` allowlist listed only four.
+- **Cache rule stated as the complement of the asset rule.** `try_files {path} /index.html` serves the shell for *every* unmatched path, so the old exact-match `@shell` allowlist of four paths left the rest with no `Cache-Control` at all. Both rules must become `@assets path /assets/*` and `@shell not path /assets/*` — disjoint matchers, so the response gets exactly one `Cache-Control` whatever order Caddy emits the header ops in. **Do not set `no-cache` unconditionally and override it for assets**: Caddy emits matched header ops first and `Set` is last-write-wins, so every content-hashed asset would ship `no-cache` and lose its immutable caching. This was verified by adapting both forms and reading the resulting JSON.
 - **Security headers and log rotation.** CSP, HSTS, X-Frame-Options, Permissions-Policy; `roll_size 100MiB`, `roll_keep 10`, `roll_keep_for 720h`. Drop the `-X-Powered-By` line, which Caddy never emits. Correct the header comment: an unset `GAMEMATCH_SITE` binds `:443` with Caddy's internal CA, not plain HTTP on `:80`.
 
 - [ ] **Step 4: Run it to verify it passes**
