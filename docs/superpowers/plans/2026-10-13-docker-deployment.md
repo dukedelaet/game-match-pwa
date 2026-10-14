@@ -375,6 +375,19 @@ so a fresh 'up' takes a first backup immediately."
 - Consumes: the whole stack.
 - Produces: evidence that the stack works, which the runbook then documents.
 
+**Prerequisites (found necessary in Task 5 — the stack cannot be built without them):**
+
+`apps/web/Dockerfile` copies `apps/web/dist/` and builds nothing, and `dist` is
+gitignored. On a clean clone `docker compose build web` fails with
+`"/apps/web/dist": not found`. Build the PWA on the host first:
+
+```bash
+pnpm install
+pnpm --filter web build          # produces apps/web/dist
+cp .env.example .env             # then set APP_ENV=local
+mkdir -p data backups && sudo chown -R 10001:10001 data
+```
+
 - [ ] **Step 1: Start the stack and seed**
 
 ```bash
@@ -516,11 +529,20 @@ rate limit, which is why the message names both.
 - [ ] **Step 8: Assert the data directory is host-owned, not root-owned**
 
 ```bash
-ls -ld data data/photos
+ls -ld data
 docker compose exec api ls -ld /data
 ```
 
 Expected: both report UID 10001. A mismatch here is the Review Focus item about ownership, and it is the most likely first-run failure on the VPS.
+
+Do **not** assert on `data/photos`. It is absent on a fresh stack: the image
+builds `/data/photos`, the `./data` bind mount shadows it, and only the photo
+upload handler's `MkdirAll` creates it. `ls -ld data data/photos` therefore
+fails on a correct stack. This was found in Task 5 and confirmed. It is benign
+while the directory is absent (there are no photos to archive), but if the
+directory is later lost while the database still holds photo rows, every
+subsequent backup becomes silently database-only — `scripts/backup.sh` skips
+the archive without warning, exits 0, and the container stays `healthy`.
 
 - [ ] **Step 9: Assert logs and rotation**
 

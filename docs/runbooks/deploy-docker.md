@@ -12,9 +12,9 @@ Recorded on a local machine on 2026-10-14, against the stack as committed at
 this point in the plan (Tasks 1–4). Every command below was run against the live
 stack, and every value in the output blocks is the real one — no number, header,
 status, path or count has been altered. A few blocks are trimmed to the part
-that matters; §1 drops some `Volume … Created` lines, §7(b) drops the `curl`
-line and the two `sqlite3` subshell traces, and `cat jar` omits curl's three
-comment lines. Each trimmed block says so.
+that matters: §1 drops the `Volume gamematch_caddy-config Created` and
+`Volume gamematch_caddy-data Created` lines, and `cat jar` omits curl's three
+header lines. Each trimmed block says so.
 
 Two things about how to read it:
 
@@ -178,8 +178,9 @@ $ for ip in 10.194.1.28 100.85.246.117 172.17.0.1 172.18.0.1 172.19.0.1 172.20.0
 172.20.0.1       000
 ```
 
-(wlp0s20f0u1i2, tailscale0, docker0 and the three compose bridges: 172.17, 172.18,
-172.19, 172.20 — six addresses, each refused.) `incusbr0` was not in the loop.
+(wlp0s20f0u1i2, tailscale0, docker0 — which is 172.17 — and the three compose
+bridges 172.18, 172.19, 172.20. `incusbr0` was not in the loop. Six addresses,
+each refused.)
 
 ### Step 3 — the shipped relative-root default is not in use
 
@@ -346,7 +347,7 @@ assertion it was written to fix.
 
 The blank fourth line is not a missing name in the output — it *is* the new
 user's `name`, which is genuinely NULL: `httpapi/auth.go:192-198` creates the
-row with no `Name`, and `store/users.go:80-89` defaults it to
+row with no `Name`, and `store/users.go:71-79` defaults it to
 `status=pending, onboarding_step=intent`. Use `quote(u.name)` so NULL is visible
 rather than looking like missing output.
 
@@ -463,7 +464,7 @@ With a code issued it is `{"devCode":"123456","ok":true}`. The absence of
 `devCode` *is* the signal.
 
 The limits are `limitOTPStartPerIP = 5` and `limitOTPStartPerPhone = 3` per
-`windowOTP = 15m` (`apps/server/internal/httpapi/ratelimit.go:17-20`), and they
+`windowOTP = 15m` (`apps/server/internal/httpapi/ratelimit.go:16-19`), and they
 are **persisted**, so `docker compose restart api` does not clear them:
 
 ```
@@ -492,7 +493,11 @@ $ echo $?
 ```
 
 No rows, exit 0 — and `test -n "$ID_BEFORE"` in (c) turns that into a failure.
-The tautological version in (b) returns four rows for the same input.
+Note that the tautological version in (b) also returns nothing for this input:
+no `user_private` row matches, so the subquery yields NULL and `x = NULL` is
+never true. It is therefore not a discriminating control on its own — the
+contrast that shows the tautology is the four rows it returns for `$PHONE` in
+(b), against one row (the NULL name) from the corrected join.
 
 The seeded users, for reference — `seed` creates **four** named users, and `House`
 is the only one with a NULL `phone_e164_hash`, which is why the tautological
@@ -560,8 +565,8 @@ On a genuinely fresh install that is **benign**: there are no photos to lose,
 and the first backup runs ~35s after `up`, long before anyone can upload
 anything. Nothing depends on the directory existing — every `PhotosDir` use site
 either creates it (`media.MkdirAll`, `apps/server/internal/httpapi/photos.go:42`,
-104) or tolerates its absence (`os.Remove`, `os.RemoveAll` in
-`httpapi/me.go:226-235`).
+`apps/server/internal/media/photos.go:104`) or tolerates its absence
+(`os.Remove`, `os.RemoveAll` in `httpapi/me.go:226-235`).
 
 The image builds `install -d -o 10001 -g 10001 /data/photos`, but `./data` is a
 bind mount, so the host directory shadows the image's `/data` and takes the
