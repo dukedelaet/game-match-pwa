@@ -2067,6 +2067,8 @@ $ ls -ln data
 -rw-r--r-- 1 10001 10001     0 Oct 14 15:52 gamematch.db-wal
 drwxr-x--- 1 10001 10001   144 Oct 14 15:49 photos
 
+(These two blocks drop the `total <n>` line `ls -ln` prints; nothing else.)
+
 $ sqlite3 data/gamematch.db 'SELECT count(*) FROM users;'
 6
 rc=0

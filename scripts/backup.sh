@@ -155,12 +155,20 @@ find "$BACKUP_DIR" -name 'photos-*.tar.gz' -mtime +14 -delete
 # are removed by that run's own trap.
 for sidecar in "$BACKUP_DIR"/gamematch-*.db-shm "$BACKUP_DIR"/gamematch-*.db-wal; do
 	[ -e "$sidecar" ] || continue
+	# Reset per iteration: `set -u` would abort the whole script if a future
+	# glob were added above without a matching branch here, leaving a stale
+	# value to decide a deletion.
+	snapshot=
 	case "$sidecar" in
 	*.db-shm) snapshot="${sidecar%.db-shm}.db" ;;
 	*.db-wal) snapshot="${sidecar%.db-wal}.db" ;;
 	esac
-	if [ ! -e "$snapshot" ]; then
-		rm -f "$sidecar"
+	if [ -n "$snapshot" ] && [ ! -e "$snapshot" ]; then
+		# `rm -f` failing aborts under `set -e`, which would report a
+		# backup that in fact succeeded as a failure. The snapshot is
+		# already published; a sidecar we cannot remove is not worth
+		# failing over.
+		rm -f "$sidecar" || echo "backup: could not remove $sidecar" >&2
 	fi
 done
 

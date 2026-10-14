@@ -143,7 +143,9 @@ corrupts the result.** Removing the sidecars is required, not optional.
    if [ -f "backups/photos-$STAMP.tar.gz" ]; then
        # Move the live tree aside, or every photo uploaded after the
        # snapshot survives as an orphan no database row references.
-       [ -d data/photos ] && sudo mv data/photos data/photos.pre-restore
+       if [ -d data/photos ]; then
+           sudo mv data/photos data/photos.pre-restore
+       fi
        sudo tar xzf "backups/photos-$STAMP.tar.gz" -C data
    else
        echo "no photos archive for $STAMP"
@@ -300,13 +302,21 @@ that was corrected on the compose path, and it is worth not repeating here.
 
    ```bash
    if [ -f "$BACKUP_DIR/photos-$STAMP.tar.gz" ]; then
-       [ -d "$DATA_DIR/photos" ] && sudo mv "$DATA_DIR/photos" "$DATA_DIR/photos.old"
+       if [ -d "$DATA_DIR/photos" ]; then
+           sudo mv "$DATA_DIR/photos" "$DATA_DIR/photos.old"
+       fi
        sudo tar xzf "$BACKUP_DIR/photos-$STAMP.tar.gz" -C "$DATA_DIR"
+       sudo chown -R gamematch:gamematch "$DATA_DIR/photos"
    else
        echo "no photos archive for $STAMP"
    fi
-   sudo chown -R gamematch:gamematch "$DATA_DIR/photos"
    ```
+
+   The `chown` belongs inside the guard. Left outside it, it runs against a
+   directory that does not exist when there is no archive to extract — the
+   normal case on a stack that has never had a photo uploaded — and exits 1
+   on the last line of the step. Interactively that is a confusing error; run
+   under `set -e`, steps 5 onward never execute and the service never starts.
 
 5. Start the server. Migrations run automatically on boot (the app applies any
    embedded migration newer than the database's `PRAGMA user_version`).
