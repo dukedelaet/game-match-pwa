@@ -1,0 +1,593 @@
+# Docker Deployment Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Run GameMatch under Docker Compose on a local machine and on a VPS, changing only `.env` between the two, with data in a bind-mounted `./data` that survives a container rebuild.
+
+**Architecture:** Three services in one compose file. `api` is the Go binary on `0.0.0.0:8000` with **no published port**, reachable only on the internal network. `web` is Caddy, publishing 80/443, serving `apps/web/dist` and proxying `/v1` to `api`. `backup` is an Alpine container with `sqlite3` that runs the existing `scripts/backup.sh` every 6 hours. Two multi-stage Dockerfiles, `CGO_ENABLED=0`, so pnpm and Node never enter a runtime image.
+
+**Tech Stack:** Docker Compose, `golang:1.27.2-alpine`, `caddy:2.10.2-alpine`, `alpine` (sqlite3), SQLite in WAL mode via `modernc.org/sqlite`.
+
+**Spec:** `docs/superpowers/specs/2026-10-13-docker-deployment-design.md` — the plan argues from the spec, so the spec travels with it; executors read both.
+
+## Global Constraints
+
+- `CGO_ENABLED=0` everywhere. The SQLite driver is pure Go; the binary must build and run without a C toolchain.
+- The `api` container must declare **no `ports:` mapping**. It binds `0.0.0.0:8000` because container loopback is not reachable from a sibling container. Publishing it would expose the API directly on the host, bypassing TLS and every header in the Caddyfile.
+- `DATA_DIR=/data` in both `api` and `backup`. Every SQLite path derives from it (`store.Config.DBPath()`, `PhotosDir()`), so no Go code changes.
+- The container runs as UID **10001**, non-root. `./data` is created on the host by that UID.
+- No Go or TypeScript source changes. No dependency additions. No schema changes.
+- `APP_ENV=local` locally (OTP `123456`, log SMS provider, `seed` demo users). `APP_ENV=production` on the VPS with real credentials. The compose file is identical between them.
+- `scripts/backup.sh` is reused **unchanged**. It already takes `DATA_DIR` from the environment and its output directory as `$1`.
+
+## Review Focus
+
+Five input classes the spec implies that no task's tests exercise. Each gets a test in the task that owns the relevant code.
+
+1. **The API port is published by accident.** A `ports:` line added to `api`, or a `network_mode: host`, silently exposes the API on the host's public interface with no TLS. A reasonable person would expect the API to be unreachable from outside the compose network. → Task 5, step 2.
+2. **`./data` owned by the wrong UID.** The container cannot write the database and the service dies on boot with a permission error that names neither the host path nor the UID. → Task 5, step 3.
+3. **SQLite on a filesystem that does not support WAL locking.** Some VPS overlay and network filesystems break WAL. The service starts and then fails on first write, or corrupts. → Task 5, step 8.
+4. **A production config missing one variable.** `Config.Validate()` refuses to boot and names the variable — but only if the refusal survives the container boundary. If the entrypoint swallows the exit code, a VPS deploys a silently non-functional service. → Task 6, step 4.
+5. **Restoring a backup onto a stale `-wal`.** The restored database is replayed against the live sidecar and silently corrupts. → Task 7, step 5.
+
+---
+
+### Task 1: Fix `deploy/Caddyfile`
+
+The shipped Caddyfile has four defects, all verified in the audit, and it **panics Caddy on startup** when `/var/log/caddy` does not exist. Doing this first means the container work in later tasks inherits a working proxy, and #95/#96 stop being separate half-finished work.
+
+**Files:**
+- Create: `deploy/caddy-verify.sh` — verification harness
+- Modify: `deploy/Caddyfile`
+
+**Interfaces:**
+- Consumes: `apps/web/dist/` (built output), `http://api:8000` (the `api` service, from Task 3).
+- Produces: a `deploy/Caddyfile` that works with an absolute `GAMEMATCH_ROOT`, an existing log directory, and no environment-dependent working directory. Task 2's `web` image copies this file verbatim.
+
+**Note on verification:** the `caddy` binary at `/home/duke/.local/share/mise/installs/go/1.27.1/bin/caddy` is a **broken build that panics on any config, including a two-line one**. Do not use it. The step below uses `docker run --rm -v "$PWD/deploy:/etc/caddy:ro" -v "$PWD/apps/web/dist:/srv:ro" -v "$PWD/.caddytest:/var/log/caddy" caddy:2.10.2-alpine caddy run --config /etc/caddy/Caddyfile`, which uses the published image rather than the host binary.
+
+- [ ] **Step 1: Write the verification harness**
+
+`deploy/caddy-verify.sh` starts Caddy against a test root and asserts the four behaviours. It must exit non-zero on any failure.
+
+```bash
+#!/usr/bin/env bash
+# Verifies deploy/Caddyfile against a built apps/web/dist, without touching
+# the host's caddy binary (the one at /home/duke/.local/share/mise is a broken
+# build that panics on any config) and without needing a real domain.
+#
+# Usage: bash deploy/caddy-verify.sh
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PORT="${CADDY_VERIFY_PORT:-9444}"
+LOGDIR="$ROOT/.caddytest"
+WORKDIR="$ROOT/apps/web/dist"
+
+fail=0
+check() { # check <label> <expected> <actual>
+  if [ "$2" = "$3" ]; then printf '  ok   %s\n' "$1"
+  else printf '  FAIL %s: expected %s, got %s\n' "$1" "$2" "$3"; fail=1; fi
+}
+header() { # header <path> <header>  -> value or ""
+  curl -sk -o /dev/null -D - "https://127.0.0.1:$PORT$1" 2>/dev/null \
+    | tr -d '\r' | awk -v h="$2:" 'tolower($1)==tolower(h){$1="";sub(/^ /,"");print;exit}'
+}
+status() { curl -sk -o /dev/null -w '%{http_code}' "https://127.0.0.1:$PORT$1"; }
+
+if [ ! -f "$WORKDIR/index.html" ]; then
+  echo "caddy-verify: $WORKDIR/index.html missing; run 'pnpm --filter web build' first" >&2
+  exit 1
+fi
+
+# A log directory must exist: Caddy panics on startup if the directory for
+# `output file` does not, rather than reporting a usable error.
+rm -rf "$LOGDIR"; mkdir -p "$LOGDIR"
+mkdir -p "$ROOT/.caddytest"
+
+GAMEMATCH_ROOT="$WORKDIR" GAMEMATCH_SITE="localhost:$PORT" \
+GAMEMATCH_LOG_DIR="$LOGDIR" \
+docker run -d --name gm-caddy-verify -p "$PORT:$PORT" \
+  -v "$ROOT/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" \
+  -v "$WORKDIR:/srv/dist:ro" \
+  -v "$LOGDIR:/var/log/caddy" \
+  caddy:2.10.2-alpine caddy run --config /etc/caddy/Caddyfile >/dev/null
+
+# Wait for the listener rather than sleeping a fixed amount.
+for _ in $(seq 1 40); do
+  if [ "$(status /)" != "000" ]; then break; fi
+  sleep 0.25
+done
+
+echo "caddy-verify:"
+check "GET / serves the shell"            200 "$(status /)"
+check "GET /boot (PWA start_url) serves"   200 "$(status /boot)"
+check "GET /deep/spa/route falls back"     200 "$(status /deep/spa/route)"
+check "/boot is not cached"                "no-cache" "$(header /boot Cache-Control)"
+
+asset="$(ls "$WORKDIR/assets" | grep -m1 '\.js$')"
+check "asset is immutable"                 "public, max-age=31536000, immutable" \
+      "$(header "/assets/$asset" Cache-Control)"
+check "nosniff present"                    "nosniff" "$(header / X-Content-Type-Options)"
+check "CSP present"                        "1" "$(test -n "$(header / Content-Security-Policy)" && echo 1 || echo 0)"
+check "HSTS present"                       "1" "$(test -n "$(header / Strict-Transport-Security)" && echo 1 || echo 0)"
+check "X-Frame-Options present"            "1" "$(test -n "$(header / X-Frame-Options)" && echo 1 || echo 0)"
+
+docker rm -f gm-caddy-verify >/dev/null 2>&1 || true
+rm -rf "$ROOT/.caddytest"
+exit "$fail"
+```
+
+- [ ] **Step 2: Run it to verify it fails**
+
+Run: `pnpm --filter web build && bash deploy/caddy-verify.sh`
+
+Expected: FAIL. Specifically `/boot is not cached` (the `@shell` matcher is an exact-match allowlist that misses it) and `CSP present` / `HSTS present` / `X-Frame-Options present` (no such headers are set). `/`, `/boot` and the SPA fallback should already be 200 because the harness supplies an absolute `GAMEMATCH_ROOT` and an existing log directory — that is the harness isolating one defect at a time, and it is why Steps 3–4 can be verified separately.
+
+- [ ] **Step 3: Rewrite `deploy/Caddyfile`**
+
+Three changes, all from the spec:
+
+- **Absolute root.** `root * {$GAMEMATCH_ROOT:/srv/dist}`. The default resolves inside the image where it always exists, with no environment-dependent working directory — which is what makes the container design safe. `$GAMEMATCH_LOG_DIR` replaces the hardcoded `/var/log/caddy`.
+- **Cache rule moved out of the matcher.** `no-cache` goes on the whole handler with `@assets` overriding it, because `try_files {path} /index.html` serves the shell for *every* unmatched path while the old `@shell` allowlist listed only four.
+- **Security headers and log rotation.** CSP, HSTS, X-Frame-Options, Permissions-Policy; `roll_size 100MiB`, `roll_keep 10`, `roll_keep_for 720h`. Drop the `-X-Powered-By` line, which Caddy never emits. Correct the header comment: an unset `GAMEMATCH_SITE` binds `:443` with Caddy's internal CA, not plain HTTP on `:80`.
+
+- [ ] **Step 4: Run it to verify it passes**
+
+Run: `bash deploy/caddy-verify.sh`
+
+Expected: every line `ok`, exit 0.
+
+- [ ] **Step 5: Confirm Caddy itself is well-formed**
+
+Run: `docker run --rm -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2.10.2-alpine caddy validate --config /etc/caddy/Caddyfile`
+
+Expected: `Valid configuration`. This is what the host binary could not be trusted to tell us.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add deploy/Caddyfile deploy/caddy-verify.sh
+git commit -m "fix(deploy): absolute root, correct cache rule, security headers
+
+The shipped Caddyfile resolved \$GAMEMATCH_ROOT relative to Caddy's working
+directory, which for the packaged unit is /, so every static asset 404'd
+while the API health check still passed. The @shell cache matcher was an
+exact-match allowlist of four paths, so the PWA's own start_url /boot was
+served uncached and returning users could hold a stale index.html. The
+access log had no rotation, and Caddy panics on startup rather than
+reporting a usable error when the log directory does not exist.
+
+Adds the security headers the audit found missing, and a verification
+harness that runs the published caddy image rather than the host binary."
+```
+
+---
+
+### Task 2: Container images
+
+**Files:**
+- Create: `apps/server/Dockerfile`
+- Create: `apps/web/Dockerfile`
+- Create: `.dockerignore`
+- Modify: `.gitignore`
+
+**Interfaces:**
+- Consumes: `scripts/backup.sh` (Task 3 mounts it), `deploy/Caddyfile` (Task 1, copied into the web image), `apps/web/dist` (built output).
+- Produces: images `gamematch-api:latest` and `gamematch-web:latest`. Task 3's compose file references both by name.
+
+- [ ] **Step 1: Write the failing verification**
+
+Run these before the files exist.
+
+```bash
+cd apps/server && CGO_ENABLED=0 docker build -t gamematch-api:latest . && \
+  docker run --rm gamematch-api:latest id -u
+```
+
+Expected: FAIL — no `Dockerfile` in `apps/server`.
+
+- [ ] **Step 2: Create `apps/server/Dockerfile`**
+
+Multi-stage. Build stage `golang:1.27.2-alpine` matching `mise.toml`; runtime `alpine` with `ca-certificates` and `tzdata` only. Non-root UID 10001 with a matching `/data`.
+
+- [ ] **Step 3: Create `apps/web/Dockerfile`**
+
+`caddy:2.10.2-alpine`, copying `apps/web/dist` to `/srv/dist` and `deploy/Caddyfile` to `/etc/caddy/Caddyfile`. This image builds nothing — it serves prebuilt output, so a web change does not invalidate the API image.
+
+- [ ] **Step 4: Create `.dockerignore`**
+
+Exclude `node_modules`, `.git`, `apps/web/dist`, `apps/server/data`, `data`, `backups`, `.env`, `*.log`, and `docs`. Without this, a stray `node_modules` can reach the build context and the API image becomes enormous.
+
+- [ ] **Step 5: Extend `.gitignore`**
+
+Add `.env` variants (`#97` notes `.env.*` is not ignored), `/data/`, `/backups/`, `.caddytest/`. Keep `!.env.example` un-ignored.
+
+- [ ] **Step 6: Build both images and verify the API image is clean**
+
+```bash
+docker build -t gamematch-api:latest apps/server
+docker build -t gamematch-web:latest apps/web
+docker run --rm gamematch-api:latest id -u          # 10001
+docker run --rm gamematch-api:latest ls /srv         # must fail: no dist in the API image
+docker run --rm gamematch-api:latest sh -c 'which go' # must fail: no toolchain
+docker run --rm gamematch-web:latest ls /srv/dist/index.html
+```
+
+Expected: UID `10001`; both "must fail" checks fail; the web image serves the built shell.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add apps/server/Dockerfile apps/web/Dockerfile .dockerignore .gitignore
+git commit -m "build: multi-stage container images for the API and the PWA
+
+CGO_ENABLED=0 throughout, so the pure-Go SQLite driver produces a static
+binary and no C toolchain is needed at build or run time. The API image
+carries no dist/ and no toolchain; the web image builds nothing and serves
+prebuilt output, so a frontend change does not invalidate the API image."
+```
+
+---
+
+### Task 3: Compose file and `.env`
+
+**Files:**
+- Create: `docker-compose.yml`
+- Create: `.env.example`
+- Create: `.env` (gitignored, local only)
+
+**Interfaces:**
+- Consumes: images from Task 2, `deploy/Caddyfile` from Task 1, `scripts/backup.sh`.
+- Produces: `docker compose up` reaching a healthy state; the service names `api`, `web`, `backup`.
+
+- [ ] **Step 1: Create `docker-compose.yml`**
+
+Three services. `api` declares **no `ports:`**. `web` publishes `${HTTP_PORT:-80}:80` and `${HTTPS_PORT:-443}:443`. `backup` sleeps between runs.
+
+- [ ] **Step 2: Create `.env.example`**
+
+Both configurations in one file, with the production section uncommented-by-default and a clearly marked local section:
+
+```
+# --- local (APP_ENV=local) ---
+APP_ENV=local
+APP_DEBUG=true
+DEV_OTP=123456
+
+# --- VPS (APP_ENV=production): uncomment and fill ---
+# APP_ENV=production
+# APP_DEBUG=false
+# DEV_OTP=            must stay unset
+# SMS_PROVIDER=twilio
+# TWILIO_ACCOUNT_SID=
+# TWILIO_AUTH_TOKEN=
+# TWILIO_FROM=
+# TURNSTILE_SECRET=
+```
+
+`DEV_OTP` is commented rather than empty in the local block because it must be *absent* in production — `Config.Validate()` rejects it there, and a blank line would read as present.
+
+- [ ] **Step 3: Verify compose resolves**
+
+```bash
+cp .env.example .env
+docker compose config >/dev/null && echo "compose config OK"
+docker compose config | grep -A3 '^  api:' | grep -c 'published'
+```
+
+Expected: `compose config OK`, and `0` — the API must publish nothing.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add docker-compose.yml .env.example
+git commit -m "build: compose stack with api, web and a scheduled backup
+
+The api service declares no ports mapping. It binds 0.0.0.0 because
+container loopback is unreachable from a sibling container, and the
+exposure is contained by never publishing the port -- publishing it would
+put the API on the host's public interface, bypassing TLS and every header
+in the Caddyfile."
+```
+
+---
+
+### Task 4: Backup container
+
+**Files:**
+- Modify: `docker-compose.yml` (the `backup` service, added here rather than in Task 3 so it can be verified alone)
+- Modify: `scripts/backup.sh` **only if** its defaults need adjusting for the container — the spec says reuse unchanged, so first confirm they do not.
+
+**Interfaces:**
+- Consumes: `scripts/backup.sh`, `./data` (read-only), `./backups` (write).
+- Produces: snapshots at `./backups/gamematch-<stamp>.db` and `./backups/photos-<stamp>.tar.gz`.
+
+- [ ] **Step 1: Confirm the script works unmodified in a container**
+
+```bash
+docker run --rm -v "$PWD/scripts:/scripts:ro" -v "$PWD/data:/data:ro" \
+  -v "$PWD/backups:/backup" alpine:3.20 sh -c \
+  'apk add --no-cache sqlite3 >/dev/null && DATA_DIR=/data /bin/sh /scripts/backup.sh /backup'
+```
+
+Expected: `backup: wrote /backup/gamematch-<stamp>.db`. If it fails on `command -v sqlite3` or a path default, that is the signal to adjust — record the change rather than guessing.
+
+- [ ] **Step 2: Add the `backup` service**
+
+A long-running container that runs once immediately, then every 6 hours: `sh -c 'while true; do /scripts/backup.sh /backups; sleep 21600; done'`. Running on start means a fresh `up` takes a first backup without waiting 6 hours.
+
+- [ ] **Step 3: Verify a snapshot is produced and is valid**
+
+```bash
+mkdir -p data backups
+docker compose up -d backup
+sleep 5
+ls -la backups/
+SNAP="$(ls -t backups/gamematch-*.db | head -1)"
+sqlite3 "$SNAP" 'PRAGMA integrity_check;'      # ok
+sqlite3 "$SNAP" 'SELECT count(*) FROM sqlite_master;'  # > 0, not 0
+```
+
+Expected: a `.db` and a `.tar.gz`; `ok`; a non-zero schema count. A snapshot with no schema is the failure mode `restore.md` documents, and the script is supposed to refuse it.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add docker-compose.yml
+git commit -m "build: run the existing backup script on a 6-hourly schedule
+
+Reuses scripts/backup.sh unchanged: it already takes DATA_DIR from the
+environment and its output directory as \$1, and its sqlite3 .backup
+approach is what makes a WAL-mode snapshot consistent. Runs once on start
+so a fresh 'up' takes a first backup immediately."
+```
+
+---
+
+### Task 5: End-to-end local run
+
+**Files:** none new. This task verifies Tasks 1–4 together.
+
+**Interfaces:**
+- Consumes: the whole stack.
+- Produces: evidence that the stack works, which the runbook then documents.
+
+- [ ] **Step 1: Start the stack and seed**
+
+```bash
+docker compose up -d --build
+docker compose run --rm api seed
+docker compose ps
+```
+
+Expected: `api`, `web`, `backup` up. `api seed` is idempotent.
+
+- [ ] **Step 2: Assert the API port is NOT published**
+
+```bash
+docker compose ps --format '{{.Service}} {{.Ports}}'
+curl -s -o /dev/null -w '%{http_code}\n' --max-time 3 http://127.0.0.1:8000/v1/healthz
+```
+
+Expected: `api` shows no `0.0.0.0:8000->` mapping, and the curl returns `000` (connection refused). This is the single assertion that would catch a regression in the property this design exists to protect. If it returns `200`, stop and fix before continuing.
+
+- [ ] **Step 3: Assert the proxy reaches the API, not just that the API is up**
+
+```bash
+curl -sk -o /dev/null -w '%{http_code}\n' https://localhost/v1/healthz
+```
+
+Expected: `200`. A `000` here means Caddy cannot reach `api` — the failure that would happen if `ADDR` were left at `127.0.0.1:8000`.
+
+- [ ] **Step 4: Assert the SPA is served with the right caching**
+
+```bash
+curl -sk -o /dev/null -w '%{http_code}\n' https://localhost/boot
+curl -skI https://localhost/boot | grep -i cache-control
+curl -sk -o /dev/null -w '%{http_code}\n' https://localhost/deep/spa/route
+```
+
+Expected: `200`, `Cache-Control: no-cache`, `200`.
+
+- [ ] **Step 5: Assert security headers**
+
+```bash
+for h in Content-Security-Policy Strict-Transport-Security X-Frame-Options Permissions-Policy X-Content-Type-Options; do
+  printf '%-32s %s\n' "$h" "$(curl -skI https://localhost/ | grep -ci "^$h:")"
+done
+```
+
+Expected: `1` for each.
+
+- [ ] **Step 6: Assert data survives a restart**
+
+```bash
+BEFORE="$(sqlite3 data/gamematch.db 'SELECT count(*) FROM users;')"
+
+# Sign in end to end, so a real user row exists to lose.
+curl -sk -X POST https://localhost/v1/auth/otp/start  -d '{"phone":"+15551239999"}' -o /dev/null
+CODE="$(sqlite3 data/gamematch.db "SELECT code FROM otp_codes WHERE phone_e164 = '+15551239999';")"
+curl -sk -X POST https://localhost/v1/auth/otp/verify -d "{\"phone\":\"+15551239999\",\"code\":\"$CODE\"}" -o /dev/null
+test -n "$CODE" || { echo "could not read the local OTP; is APP_ENV=local?"; exit 1; }
+
+docker compose restart api
+AFTER="$(sqlite3 data/gamematch.db 'SELECT count(*) FROM users;')"
+printf 'before=%s after=%s\n' "$BEFORE" "$AFTER"
+test "$AFTER" -gt "$BEFORE" || { echo "FAIL: the user did not survive the restart"; exit 1; }
+sqlite3 data/gamematch.db "SELECT name FROM users WHERE phone_e164_hash = (SELECT phone_e164_hash FROM user_private WHERE phone_e164 = '+15551239999');"
+```
+
+Expected: `after` greater than `before`, and the last query printing a name. This proves the bind mount is the real state, and it exercises WAL locking — a filesystem that cannot support it fails right here. `APP_ENV=local` must be set or the OTP cannot be read, which is why the step asserts `$CODE` is non-empty rather than assuming it.
+
+- [ ] **Step 7: Assert the data directory is host-owned, not root-owned**
+
+```bash
+ls -ld data data/photos
+docker compose exec api ls -ld /data
+```
+
+Expected: both report UID 10001. A mismatch here is the Review Focus item about ownership, and it is the most likely first-run failure on the VPS.
+
+- [ ] **Step 8: Assert logs and rotation**
+
+```bash
+docker compose logs --tail 20 web
+docker compose exec web ls -la /var/log/caddy
+```
+
+Expected: Caddy started cleanly with no panic, and the access log exists with `roll_size` configured.
+
+- [ ] **Step 9: Record the evidence**
+
+Paste the actual outputs of steps 2–8 into `docs/runbooks/deploy-docker.md` as a "verified on local Docker" section. Do not paraphrase; the next person needs to see the real numbers.
+
+---
+
+### Task 6: Production boot path
+
+Local runs use `APP_ENV=local`, so nothing so far exercises `Config.Validate()`. This task closes the Review Focus gap about a missing production variable being swallowed at the container boundary.
+
+**Files:** none new. `.env` is modified and restored.
+
+**Interfaces:**
+- Consumes: the stack from Task 5.
+- Produces: evidence that the production boot path works and still fails loudly.
+
+- [ ] **Step 1: Boot in production mode with placeholder credentials**
+
+```bash
+cp .env .env.local.bak
+sed -i 's/^APP_ENV=.*/APP_ENV=production/; s/^APP_DEBUG=.*/APP_DEBUG=false/' .env
+printf 'SMS_PROVIDER=twilio\nTWILIO_ACCOUNT_SID=ACplaceholder\nTWILIO_AUTH_TOKEN=placeholder\nTWILIO_FROM=+15550000000\nTURNSTILE_SECRET=0xplaceholder\n' >> .env
+docker compose up -d api
+sleep 5
+docker compose ps api
+```
+
+Expected: `api` is **running**, not restarting. It cannot deliver a real OTP against placeholder credentials — that is expected and is why Task 5 covers signing in. This step proves `Validate()` passes and the process starts.
+
+- [ ] **Step 2: Assert the API port is still closed in production mode**
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' --max-time 3 http://127.0.0.1:8000/v1/healthz
+```
+
+Expected: `000`. Environment must not change this.
+
+- [ ] **Step 3: Assert APP_DEBUG is genuinely off**
+
+```bash
+curl -sk -X POST https://localhost/v1/auth/otp/start -d '{"phone":"+15551230000"}'
+```
+
+Expected: `{"ok":true}` with **no `devCode` key**. If `devCode` appears, `APP_DEBUG` is on in production — the exact hole `Config.Validate()` was written to close.
+
+- [ ] **Step 4: Assert a missing variable still fails the boot**
+
+```bash
+sed -i '/^TURNSTILE_SECRET=/d' .env
+docker compose up -d --force-recreate api
+sleep 5
+docker compose logs api | tail -20
+docker compose ps api
+```
+
+Expected: the container **exits non-zero**, and the log names `TURNSTILE_SECRET`. A container that stays up here means the entrypoint swallowed the exit code, which would let a VPS deploy a silently non-functional service.
+
+- [ ] **Step 5: Restore local config**
+
+```bash
+mv .env.local.bak .env
+docker compose up -d --force-recreate api
+docker compose ps
+```
+
+Expected: `api` running, `APP_ENV=local`.
+
+- [ ] **Step 6: Record the evidence**
+
+Append the actual output of steps 1–4 to `docs/runbooks/deploy-docker.md` under a "Verified: production boot path" heading. This task changes no tracked code, but its result is the only evidence that `Validate()` works through a container, and it is not reproducible from the repo alone.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add docs/runbooks/deploy-docker.md
+git commit -m "docs: record the verified production boot path
+
+Local runs use APP_ENV=local, so nothing in the normal test flow exercises
+Config.Validate(). This records a real production-mode boot with
+placeholder credentials, and a boot with TURNSTILE_SECRET removed that
+correctly exits non-zero naming it."
+```
+
+---
+
+### Task 7: Runbooks
+
+**Files:**
+- Create: `docs/runbooks/deploy-docker.md`
+- Modify: `docs/runbooks/deploy.md`
+- Modify: `docs/runbooks/restore.md`
+
+**Interfaces:**
+- Consumes: the verified output from Task 5 and Task 6.
+- Produces: the documents someone follows on the VPS.
+
+- [ ] **Step 1: Write `docs/runbooks/deploy-docker.md`**
+
+Local test flow, then VPS deploy. The VPS section must include, in order: clone, `cp .env.example .env`, fill in the production variables, `mkdir -p data backups && chown -R 10001:10001 data`, `docker compose up --build -d`. State that DNS must point at the host **before** first start so Caddy can obtain a certificate.
+
+Include a troubleshooting table keyed to the failures this stack actually produces: API unreachable through Caddy (`ADDR` left at loopback), permission denied on `./data` (UID), Caddy certificate failure (DNS not yet pointed), and a database that will not open (filesystem without WAL support).
+
+- [ ] **Step 2: Repoint `deploy.md`**
+
+Mark the systemd path as legacy and link the Docker runbook as supported. Keep the systemd instructions — someone may already be running them — but do not leave them reading as the primary path.
+
+- [ ] **Step 3: Add container-aware steps to `restore.md`**
+
+The `rm -f "$DATA_DIR"/gamematch.db-{wal,shm}` step becomes `docker compose stop api` first, so no live process rewrites the sidecars mid-restore. Keep the existing warning about not copying a live `.db`.
+
+- [ ] **Step 4: Verify the restore actually works**
+
+```bash
+docker compose stop api
+STAMP="$(ls -t backups/gamematch-*.db | head -1)"
+sqlite3 "$STAMP" 'SELECT count(*) FROM users;' > /tmp/opencode/before.txt
+mv data/gamematch.db data/gamematch.db.pre-restore
+rm -f data/gamematch.db-wal data/gamematch.db-shm
+cp "$STAMP" data/gamematch.db
+chown 10001:10001 data/gamematch.db
+docker compose start api
+sleep 3
+curl -sk -o /dev/null -w '%{http_code}\n' https://localhost/v1/healthz
+sqlite3 data/gamematch.db 'SELECT count(*) FROM users;' > /tmp/opencode/after.txt
+diff /tmp/opencode/before.txt /tmp/opencode/after.txt && echo "restore verified"
+```
+
+Expected: `200`, and `restore verified` — identical counts. A mismatch means the restore lost committed data, which is precisely the WAL failure `restore.md` warns about.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add docs/runbooks/deploy-docker.md docs/runbooks/deploy.md docs/runbooks/restore.md
+git commit -m "docs: Docker runbook, with a verified local walkthrough
+
+Records the actual output of the local verification rather than a
+paraphrase, so the VPS deploy has a known-good reference. Restore steps
+now stop the API container first, so no live process rewrites the WAL
+sidecars mid-restore."
+```
+
+---
+
+## Task dependency map
+
+```
+Task 1 (Caddyfile)      ─┐
+                          ├─> Task 3 (compose) ─> Task 5 (e2e) ─> Task 6 (prod) ─> Task 7 (docs)
+Task 2 (images)         ─┘         │
+                                    └─> Task 4 (backup) ──┘
+```
+
+Tasks 1 and 2 are independent and can run in either order. Task 3 needs both. Tasks 4 and 5 need 3. Tasks 6 and 7 need 5.
